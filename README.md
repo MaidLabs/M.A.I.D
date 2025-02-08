@@ -1,3 +1,13 @@
+Next updates: 
+Break training logic into smaller files for easier future impiementations
+More training options and customizations
+More plugins for cell counting, with cellpose and deepcell
+Possibly, an installer but file will be quite large. For now it is recommended to just compile it as following with your own venv or conda:
+
+![image](https://github.com/user-attachments/assets/97b65495-f47f-438e-b508-efce53a6859c)
+
+  
+
 # Index
 
 1. [Preprocessing Plugin](#preprocessing-plugin)  
