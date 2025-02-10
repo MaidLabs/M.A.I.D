@@ -7,8 +7,8 @@ import shutil
 import random
 import time
 import gc
-import logging
 import importlib.util
+import platform
 from collections import Counter
 from typing import Tuple, Dict, Any, List, Optional, Union
 import unittest
@@ -35,41 +35,14 @@ from torch.optim.lr_scheduler import (
 import optuna
 from pytorch_lightning.tuner.tuning import Tuner
 
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-
-from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score
-from sklearn.model_selection import StratifiedShuffleSplit
-
-from PyQt5.QtCore import QThread, pyqtSignal
-from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QFileDialog, QDoubleSpinBox, QSpinBox,
-    QCheckBox, QComboBox, QTextEdit, QProgressBar, QMessageBox
-)
-
-# If you have a local base_plugin.py for your system:
+# For GPU VRAM checks (optional)
 try:
-    from base_plugin import BasePlugin
-except ImportError:
-    # Fallback stub if it doesn't exist in your environment
-    class BasePlugin:
-        def __init__(self):
-            pass
-
-try:
-    from pytorch_optimizer import Lamb as LambClass
-    HAVE_LAMB = True
-except ImportError:
-    LambClass = None
-    HAVE_LAMB = False
-
-try:
-    import pynvml  # For VRAM checks
+    import pynvml
     HAVE_PYNVML = True
 except ImportError:
     HAVE_PYNVML = False
 
+# For plotting confusion matrix, etc. (optional)
 try:
     import matplotlib
     import matplotlib.pyplot as plt
@@ -78,29 +51,61 @@ try:
 except ImportError:
     HAVE_MPL = False
 
-# Optional: For performance
+# For advanced optimizers
+try:
+    from pytorch_optimizer import Lamb as LambClass
+    from pytorch_optimizer import Lion as LionClass
+    HAVE_LAMB = True
+    HAVE_LION = True
+except ImportError:
+    LambClass = None
+    LionClass = None
+    HAVE_LAMB = False
+    HAVE_LION = False
+
+# Attempt to import timm for additional models
+try:
+    import timm
+    HAVE_TIMM = True
+except ImportError:
+    HAVE_TIMM = False
+
+# Albumentations
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+# Sklearn metrics
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.model_selection import StratifiedShuffleSplit
+
+# === Removed QThread usage; keep PyQt imports for GUI ===
+from PyQt5.QtCore import pyqtSignal, Qt, QTimer
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QLineEdit, QFileDialog, QDoubleSpinBox, QSpinBox,
+    QCheckBox, QComboBox, QProgressBar, QMessageBox,
+    QGroupBox, QScrollArea
+)
+
+# For multiprocessing
+import multiprocessing
+
+# Base plugin stub if missing
+try:
+    from base_plugin import BasePlugin
+except ImportError:
+    class BasePlugin:
+        def __init__(self):
+            pass
+
+# Optional: for performance in GPU training
 torch.backends.cudnn.benchmark = True
 
-# -----------------------------------
-#  LOGGING SETUP
-# -----------------------------------
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    formatter = logging.Formatter("[%(levelname)s] %(name)s: %(message)s")
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
 
-
-# ==============================
-# 1) CONFIG OBJECTS & HELPERS
-# ==============================
+# ======================
+# 1) CONFIG CLASSES
+# ======================
 class DataConfig:
-    """
-    Holds dataset-related configuration.
-    """
     def __init__(
         self,
         root_dir: str,
@@ -117,11 +122,9 @@ class DataConfig:
 
 
 class TrainConfig:
-    """
-    Holds all training-related parameters.
-    """
     def __init__(
         self,
+        # Basic training params
         max_epochs: int,
         architecture: str,
         lr: float,
@@ -176,11 +179,63 @@ class TrainConfig:
         run_gc: bool = False,
         enable_tta: bool = False,
         profile_memory: bool = False,
-        # For custom model import:
         load_custom_model: bool = False,
         custom_model_path: str = "",
-        # Optionally support dynamic architecture file
-        custom_architecture_file: str = ""
+        custom_architecture_file: str = "",
+
+        # Advanced augs
+        random_gamma: bool = False,
+        random_gamma_limit_low: float = 80.0,
+        random_gamma_limit_high: float = 120.0,
+        random_gamma_prob: float = 0.5,
+
+        clahe: bool = False,
+        clahe_clip_limit: float = 4.0,
+        clahe_tile_size: int = 8,
+        clahe_prob: float = 0.3,
+
+        channel_shuffle: bool = False,
+        channel_shuffle_prob: float = 0.2,
+
+        use_posterize_solarize_equalize: bool = False,
+        pse_prob: float = 0.2,
+        posterize_bits: int = 4,
+        solarize_threshold: int = 128,
+
+        sharpen_denoise: bool = False,
+        sharpen_prob: float = 0.3,
+        sharpen_alpha_min: float = 0.2,
+        sharpen_alpha_max: float = 0.5,
+        sharpen_lightness_min: float = 0.5,
+        sharpen_lightness_max: float = 1.0,
+
+        gauss_vs_mult_noise: bool = False,
+        gauss_mult_prob: float = 0.3,
+        gauss_noise_var_limit_low: float = 10.0,
+        gauss_noise_var_limit_high: float = 50.0,
+        mult_noise_lower: float = 0.9,
+        mult_noise_upper: float = 1.1,
+
+        cutout_coarse_dropout: bool = False,
+        cutout_max_holes: int = 8,
+        cutout_max_height: int = 32,
+        cutout_max_width: int = 32,
+        cutout_prob: float = 0.5,
+
+        use_shift_scale_rotate: bool = False,
+        ssr_shift_limit: float = 0.1,
+        ssr_scale_limit: float = 0.1,
+        ssr_rotate_limit: int = 15,
+        ssr_prob: float = 0.4,
+
+        use_one_of_advanced_transforms: bool = False,
+        one_of_advanced_transforms_prob: float = 0.5,
+
+        # Specifically for CoAtNet: RandAugment usage
+        use_randaugment: bool = False,
+
+        # NEW: persistent_workers param
+        persistent_workers: bool = False
     ):
         self.max_epochs = max_epochs
         self.architecture = architecture
@@ -250,36 +305,65 @@ class TrainConfig:
         self.custom_model_path = custom_model_path
         self.custom_architecture_file = custom_architecture_file
 
+        # Advanced augs
+        self.random_gamma = random_gamma
+        self.random_gamma_limit_low = random_gamma_limit_low
+        self.random_gamma_limit_high = random_gamma_limit_high
+        self.random_gamma_prob = random_gamma_prob
 
-def get_available_vram() -> float:
-    """
-    Returns an approximate available VRAM in MB for the current GPU.
-    If CUDA is not available or cannot fetch, returns a large number.
-    """
-    if not torch.cuda.is_available():
-        return 999999.0
-    if not HAVE_PYNVML:
-        return 999999.0
-    try:
-        import pynvml
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        free_mem_mb = info.free / 1024**2
-        pynvml.nvmlShutdown()
-        return free_mem_mb
-    except Exception:
-        return 999999.0
+        self.clahe = clahe
+        self.clahe_clip_limit = clahe_clip_limit
+        self.clahe_tile_size = clahe_tile_size
+        self.clahe_prob = clahe_prob
+
+        self.channel_shuffle = channel_shuffle
+        self.channel_shuffle_prob = channel_shuffle_prob
+
+        self.use_posterize_solarize_equalize = use_posterize_solarize_equalize
+        self.pse_prob = pse_prob
+        self.posterize_bits = posterize_bits
+        self.solarize_threshold = solarize_threshold
+
+        self.sharpen_denoise = sharpen_denoise
+        self.sharpen_prob = sharpen_prob
+        self.sharpen_alpha_min = sharpen_alpha_min
+        self.sharpen_alpha_max = sharpen_alpha_max
+        self.sharpen_lightness_min = sharpen_lightness_min
+        self.sharpen_lightness_max = sharpen_lightness_max
+
+        self.gauss_vs_mult_noise = gauss_vs_mult_noise
+        self.gauss_mult_prob = gauss_mult_prob
+        self.gauss_noise_var_limit_low = gauss_noise_var_limit_low
+        self.gauss_noise_var_limit_high = gauss_noise_var_limit_high
+        self.mult_noise_lower = mult_noise_lower
+        self.mult_noise_upper = mult_noise_upper
+
+        self.cutout_coarse_dropout = cutout_coarse_dropout
+        self.cutout_max_holes = cutout_max_holes
+        self.cutout_max_height = cutout_max_height
+        self.cutout_max_width = cutout_max_width
+        self.cutout_prob = cutout_prob
+
+        self.use_shift_scale_rotate = use_shift_scale_rotate
+        self.ssr_shift_limit = ssr_shift_limit
+        self.ssr_scale_limit = ssr_scale_limit
+        self.ssr_rotate_limit = ssr_rotate_limit
+        self.ssr_prob = ssr_prob
+
+        self.use_one_of_advanced_transforms = use_one_of_advanced_transforms
+        self.one_of_advanced_transforms_prob = one_of_advanced_transforms_prob
+
+        # RandAugment for CoAtNet
+        self.use_randaugment = use_randaugment
+
+        # New param: persistent workers for DataLoader
+        self.persistent_workers = persistent_workers
 
 
-# ==============================
-# 2) DATA FUNCTIONS & CLASSES
-# ==============================
+# ======================
+# 2) DATASET & SPLITS
+# ======================
 def gather_samples_and_classes(root_dir: str) -> Tuple[List[Tuple[str, int]], List[str]]:
-    """
-    Gather image samples and class names from the given root directory.
-    Skips corrupt or non-image files more gracefully.
-    """
     if not os.path.isdir(root_dir):
         raise ValueError(f"Invalid root_dir: {root_dir}")
 
@@ -301,6 +385,7 @@ def gather_samples_and_classes(root_dir: str) -> Tuple[List[Tuple[str, int]], Li
             for fpath in file_list:
                 if not os.path.isfile(fpath):
                     continue
+                # Basic corrupt-file check
                 try:
                     with open(fpath, "rb") as fp:
                         _ = fp.read(20)
@@ -312,9 +397,6 @@ def gather_samples_and_classes(root_dir: str) -> Tuple[List[Tuple[str, int]], Li
 
 
 class AlbumentationsDataset(Dataset):
-    """
-    A PyTorch Dataset wrapper that applies Albumentations transforms.
-    """
     def __init__(
         self,
         samples: List[Tuple[str, int]],
@@ -337,15 +419,17 @@ class AlbumentationsDataset(Dataset):
         if image_bgr is None:
             raise OSError(f"Failed to load or corrupt image: {fpath}")
 
-        if len(image_bgr.shape) == 2:  # single channel
+        # Convert grayscale to BGR if allowed
+        if len(image_bgr.shape) == 2:
             if not self.allow_grayscale:
                 raise ValueError(
-                    f"Encountered a single-channel image but allow_grayscale=False: {fpath}"
+                    f"Single-channel image but allow_grayscale=False: {fpath}"
                 )
             else:
                 image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
 
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
         if self.transform:
             augmented = self.transform(image=image_rgb)
             image_tensor = augmented["image"].float()
@@ -357,9 +441,9 @@ class AlbumentationsDataset(Dataset):
         return image_tensor, label
 
 
-# =====================
-# 3) AUGMENTATION UTILS
-# =====================
+# ======================
+# 3) MIXUP/CUTMIX
+# ======================
 def mixup_data(x: torch.Tensor, y: torch.Tensor, alpha: float = 1.0):
     if alpha <= 0:
         return x, y, y, 1.0
@@ -396,39 +480,11 @@ def cutmix_data(x: torch.Tensor, y: torch.Tensor, alpha: float = 1.0):
     return x_cut, y_a, y_b, lam
 
 
-def custom_collate_fn(
-    batch: List[Tuple[torch.Tensor, int]],
-    use_mixup: bool = False,
-    use_cutmix: bool = False,
-    alpha: float = 1.0
-):
-    images, labels = list(zip(*batch))
-    images_tensor = torch.stack(images, dim=0)
-    labels_tensor = torch.tensor(labels, dtype=torch.long)
-
-    if use_mixup and use_cutmix:
-        # Decide randomly whether to apply MixUp or CutMix
-        if random.random() < 0.5:
-            mixed_x, y_a, y_b, lam = mixup_data(images_tensor, labels_tensor, alpha=alpha)
-            return mixed_x, (y_a, y_b, lam)
-        else:
-            cut_x, y_a, y_b, lam = cutmix_data(images_tensor, labels_tensor, alpha=alpha)
-            return cut_x, (y_a, y_b, lam)
-    elif use_mixup:
-        mixed_x, y_a, y_b, lam = mixup_data(images_tensor, labels_tensor, alpha=alpha)
-        return mixed_x, (y_a, y_b, lam)
-    elif use_cutmix:
-        cut_x, y_a, y_b, lam = cutmix_data(images_tensor, labels_tensor, alpha=alpha)
-        return cut_x, (y_a, y_b, lam)
-    else:
-        return images_tensor, labels_tensor
-
-
-# =========================
-# 4) LOSSES & UTIL CLASSES
-# =========================
+# ======================
+# 4) CUSTOM LOSSES
+# ======================
 class FocalLoss(nn.Module):
-    def __init__(self, alpha: float = 1.0, gamma: float = 2.0, reduction: str = "mean"):
+    def __init__(self, alpha=1.0, gamma=2.0, reduction="mean"):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -445,17 +501,10 @@ class FocalLoss(nn.Module):
         return loss
 
 
-# =========================
+# ======================
 # 5) MAIN MODEL CLASS
-# =========================
+# ======================
 class MaidClassifier(pl.LightningModule):
-    """
-    Main classifier LightningModule with:
-     - Optional partial freezing
-     - Support for TTA
-     - Weighted loss / Focal / BCE variants
-     - Option to load a user-provided custom model or custom architecture
-    """
     def __init__(
         self,
         architecture: str = "resnet18",
@@ -479,9 +528,7 @@ class MaidClassifier(pl.LightningModule):
         custom_architecture_file: str = ""
     ):
         super().__init__()
-        self.save_hyperparameters(
-            ignore=["class_weights", "scheduler_params"]
-        )
+        self.save_hyperparameters(ignore=["class_weights", "scheduler_params"])
 
         self.num_classes = num_classes
         self.lr = lr
@@ -504,21 +551,20 @@ class MaidClassifier(pl.LightningModule):
 
         self.class_names: Optional[List[str]] = None
 
-        # If BCE but num_classes > 1, fallback
-        if self.loss_function == "bce" and (num_classes > 1):
-            logger.warning("BCE with num_classes>1 is not recommended. Using cross_entropy fallback.")
+        # Safety checks
+        if self.loss_function == "bce" and self.num_classes > 1:
+            print("[WARN] BCE with num_classes>1 is not recommended. Switching to cross_entropy.")
             self.loss_function = "cross_entropy"
 
-        # Attempt dynamic import if requested
+        # Possibly load a custom model
         self.custom_model = None
         if self.load_custom_model:
             if self.custom_architecture_file and os.path.isfile(self.custom_architecture_file):
-                # Dynamic import scenario
-                logger.info(f"Loading custom architecture from: {self.custom_architecture_file}")
+                # The user’s .py file with get_model(...)
+                print(f"[INFO] Loading custom architecture from: {self.custom_architecture_file}")
                 spec = importlib.util.spec_from_file_location("custom_arch", self.custom_architecture_file)
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
-                # Suppose the user’s file has a function get_model(...)
                 if hasattr(mod, "get_model"):
                     self.custom_model = mod.get_model(num_classes=self.num_classes, pretrained=pretrained)
                     if os.path.isfile(self.custom_model_path):
@@ -526,22 +572,20 @@ class MaidClassifier(pl.LightningModule):
                             torch.load(self.custom_model_path, map_location="cpu")
                         )
                     else:
-                        logger.warning(f"Custom model weights not found: {self.custom_model_path}")
+                        print(f"[WARN] Custom model weights not found: {self.custom_model_path}")
                 else:
-                    raise ValueError("No get_model() function found in the custom architecture file.")
+                    raise ValueError("No get_model() function found in custom architecture file.")
             else:
-                # Just load .pt / .pth as a full model
+                # Load entire .pt / .pth
                 if not os.path.isfile(self.custom_model_path):
                     raise ValueError(f"Custom model path not found: {self.custom_model_path}")
-                logger.info(f"Loading entire custom model from: {self.custom_model_path}")
+                print(f"[INFO] Loading entire custom model from: {self.custom_model_path}")
                 self.custom_model = torch.load(self.custom_model_path, map_location="cpu")
 
         if self.custom_model is not None:
-            # We assume the user’s model is fully constructed with final layers
             self.backbone = None
             self.head = None
         else:
-            # Build a standard torchvision backbone
             self.backbone, in_feats = self._create_backbone(architecture, pretrained)
             if freeze_backbone:
                 for param in self.backbone.parameters():
@@ -551,49 +595,55 @@ class MaidClassifier(pl.LightningModule):
                 nn.Linear(in_feats, num_classes)
             )
 
-        # Built-in custom loss if needed
+        # Custom losses
         if self.loss_function == "focal":
             self.loss_fn = FocalLoss()
-        elif self.loss_function == "bce_single_logit" and num_classes == 1:
+        elif self.loss_function == "bce_single_logit" and self.num_classes == 1:
             self.loss_fn = nn.BCEWithLogitsLoss()
         else:
             self.loss_fn = None
 
     def _create_backbone(self, architecture: str, pretrained: bool) -> Tuple[nn.Module, int]:
-        def weight_if_pretrained(res_w):
-            return res_w if pretrained else None
+        """
+        Create a backbone (and remove its final classification layer) for known architectures.
+        Also supports some timm-based models if HAVE_TIMM = True.
+        """
+
+        def weight_if_pretrained_tv(weight_enum):
+            return weight_enum if pretrained else None
 
         arch = architecture.lower()
+        # TorchVision standard
         if arch == "resnet18":
-            m = models.resnet18(weights=weight_if_pretrained(models.ResNet18_Weights.IMAGENET1K_V1))
+            m = models.resnet18(weights=weight_if_pretrained_tv(models.ResNet18_Weights.IMAGENET1K_V1))
             in_feats = m.fc.in_features
             m.fc = nn.Identity()
             return m, in_feats
         elif arch == "resnet50":
-            m = models.resnet50(weights=weight_if_pretrained(models.ResNet50_Weights.IMAGENET1K_V2))
+            m = models.resnet50(weights=weight_if_pretrained_tv(models.ResNet50_Weights.IMAGENET1K_V2))
             in_feats = m.fc.in_features
             m.fc = nn.Identity()
             return m, in_feats
         elif arch == "resnet101":
-            m = models.resnet101(weights=weight_if_pretrained(models.ResNet101_Weights.IMAGENET1K_V2))
+            m = models.resnet101(weights=weight_if_pretrained_tv(models.ResNet101_Weights.IMAGENET1K_V2))
             in_feats = m.fc.in_features
             m.fc = nn.Identity()
             return m, in_feats
         elif arch == "densenet":
             densenet = models.densenet121(
-                weights=weight_if_pretrained(models.DenseNet121_Weights.IMAGENET1K_V1)
+                weights=weight_if_pretrained_tv(models.DenseNet121_Weights.IMAGENET1K_V1)
             )
             in_feats = densenet.classifier.in_features
             densenet.classifier = nn.Identity()
             return densenet, in_feats
         elif arch == "vgg":
-            vgg = models.vgg16(weights=weight_if_pretrained(models.VGG16_Weights.IMAGENET1K_V1))
+            vgg = models.vgg16(weights=weight_if_pretrained_tv(models.VGG16_Weights.IMAGENET1K_V1))
             in_feats = vgg.classifier[6].in_features
             vgg.classifier = nn.Sequential(*list(vgg.classifier.children())[:-1])
             return vgg, in_feats
         elif arch == "inception":
             inception = models.inception_v3(
-                weights=weight_if_pretrained(models.Inception_V3_Weights.IMAGENET1K_V1),
+                weights=weight_if_pretrained_tv(models.Inception_V3_Weights.IMAGENET1K_V1),
                 aux_logits=False
             )
             in_feats = inception.fc.in_features
@@ -601,48 +651,80 @@ class MaidClassifier(pl.LightningModule):
             return inception, in_feats
         elif arch == "mobilenet":
             mbnet = models.mobilenet_v2(
-                weights=weight_if_pretrained(models.MobileNet_V2_Weights.IMAGENET1K_V1)
+                weights=weight_if_pretrained_tv(models.MobileNet_V2_Weights.IMAGENET1K_V1)
             )
             in_feats = mbnet.classifier[1].in_features
             mbnet.classifier = nn.Identity()
             return mbnet, in_feats
         elif arch == "efficientnet_b0":
             effnet = models.efficientnet_b0(
-                weights=weight_if_pretrained(models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+                weights=weight_if_pretrained_tv(models.EfficientNet_B0_Weights.IMAGENET1K_V1)
             )
             in_feats = effnet.classifier[1].in_features
             effnet.classifier = nn.Identity()
             return effnet, in_feats
         elif arch == "convnext_tiny":
             convnext = models.convnext_tiny(
-                weights=weight_if_pretrained(models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+                weights=weight_if_pretrained_tv(models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
             )
             in_feats = convnext.classifier[2].in_features
             convnext.classifier[2] = nn.Identity()
             return convnext, in_feats
         elif arch == "convnext_large":
             convnext = models.convnext_large(
-                weights=weight_if_pretrained(models.ConvNeXt_Large_Weights.IMAGENET1K_V1)
+                weights=weight_if_pretrained_tv(models.ConvNeXt_Large_Weights.IMAGENET1K_V1)
             )
             in_feats = convnext.classifier[2].in_features
             convnext.classifier[2] = nn.Identity()
             return convnext, in_feats
+        elif arch == "convnext_base":
+            if not hasattr(models, "convnext_base"):
+                raise ValueError("convnext_base not available in your TorchVision version.")
+            convnext = models.convnext_base(
+                weights=weight_if_pretrained_tv(models.ConvNeXt_Base_Weights.IMAGENET1K_V1)
+            )
+            in_feats = convnext.classifier[2].in_features
+            convnext.classifier[2] = nn.Identity()
+            return convnext, in_feats
+        elif arch == "convnext_extralarge":
+            # Official name in TorchVision is "convnext_xlarge"
+            if not hasattr(models, "convnext_xlarge"):
+                raise ValueError("convnext_xlarge not available in your TorchVision version.")
+            convnext = models.convnext_xlarge(
+                weights=weight_if_pretrained_tv(models.ConvNeXt_XLarge_Weights.IMAGENET1K_V1)
+            )
+            in_feats = convnext.classifier[2].in_features
+            convnext.classifier[2] = nn.Identity()
+            return convnext, in_feats
+
+        # For convnext_v2 or coatnet or others from timm
         else:
-            raise ValueError(f"Unknown architecture: {architecture}")
+            if not HAVE_TIMM:
+                raise ValueError(f"Architecture '{architecture}' requires timm. Please install timm.")
+            if arch == "convnext_v2":
+                # Example timm usage
+                model_name = "convnextv2_base.fcmae_ft_in1k"
+                m = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+                in_feats = m.num_features
+                return m, in_feats
+            elif arch.startswith("coatnet_"):
+                model_name = arch  # e.g. "coatnet_0", "coatnet_1", etc.
+                m = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+                in_feats = m.num_features
+                return m, in_feats
+            else:
+                raise ValueError(f"Unknown architecture: {architecture}. Not in TorchVision or timm.")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.custom_model is not None:
             return self.custom_model(x)
-        else:
-            feats = self.backbone(x)
-            return self.head(feats)
+        feats = self.backbone(x)
+        return self.head(feats)
 
     def enable_gradient_checkpointing(self) -> None:
-        """
-        Try enabling gradient checkpointing on each module if available.
-        """
+        """Enable gradient checkpointing (if available) in the backbone."""
         if self.custom_model is not None:
-            logger.warning("Skipping gradient checkpointing for a custom model.")
+            print("[WARN] Skipping gradient checkpointing for custom model.")
             return
 
         def recurse_gc(module: nn.Module):
@@ -650,22 +732,37 @@ class MaidClassifier(pl.LightningModule):
                 if hasattr(child, "gradient_checkpointing_enable"):
                     child.gradient_checkpointing_enable()
                 recurse_gc(child)
-
         recurse_gc(self.backbone)
 
     def training_step(self, batch, batch_idx) -> torch.Tensor:
+        """
+        MixUp / CutMix are handled here so we can do multi-worker data loading on Windows without crashing.
+        """
         x, y = batch
-        if isinstance(y, tuple):
-            # mixup or cutmix
-            y_a, y_b, lam = y
+        use_mixup = getattr(self.hparams, "use_mixup", False)
+        use_cutmix = getattr(self.hparams, "use_cutmix", False)
+        alpha = getattr(self.hparams, "mix_alpha", 1.0)
+
+        if use_mixup or use_cutmix:
+            if use_mixup and use_cutmix:
+                # Randomly pick one
+                if random.random() < 0.5:
+                    x, y_a, y_b, lam = mixup_data(x, y, alpha=alpha)
+                else:
+                    x, y_a, y_b, lam = cutmix_data(x, y, alpha=alpha)
+            elif use_mixup:
+                x, y_a, y_b, lam = mixup_data(x, y, alpha=alpha)
+            else:
+                x, y_a, y_b, lam = cutmix_data(x, y, alpha=alpha)
+
             logits = self(x)
-            if (self.loss_function == "bce_single_logit"
-                    and self.num_classes == 1
-                    and self.loss_fn is not None):
-                y_a = y_a.float().unsqueeze(1)
-                y_b = y_b.float().unsqueeze(1)
-                loss_a = self.loss_fn(logits, y_a)
-                loss_b = self.loss_fn(logits, y_b)
+            if (self.hparams.loss_function == "bce_single_logit"
+                and self.num_classes == 1
+                and self.loss_fn is not None):
+                y_a_f = y_a.float().unsqueeze(1)
+                y_b_f = y_b.float().unsqueeze(1)
+                loss_a = self.loss_fn(logits, y_a_f)
+                loss_b = self.loss_fn(logits, y_b_f)
             else:
                 if self.loss_fn is None:
                     loss_a = self._compute_loss(logits, y_a)
@@ -676,9 +773,9 @@ class MaidClassifier(pl.LightningModule):
             loss = lam * loss_a + (1 - lam) * loss_b
         else:
             logits = self(x)
-            if (self.loss_function == "bce_single_logit"
-                    and self.num_classes == 1
-                    and self.loss_fn is not None):
+            if (self.hparams.loss_function == "bce_single_logit"
+                and self.num_classes == 1
+                and self.loss_fn is not None):
                 y_float = y.float().unsqueeze(1)
                 loss = self.loss_fn(logits, y_float)
             else:
@@ -691,56 +788,53 @@ class MaidClassifier(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        with torch.no_grad():
-            x, y = batch
-            logits = self(x)
-            if (self.loss_function == "bce_single_logit"
-                    and self.num_classes == 1
-                    and self.loss_fn is not None):
-                y_float = y.float().unsqueeze(1)
-                loss = self.loss_fn(logits, y_float)
-                prob = torch.sigmoid(logits)
-                preds = (prob >= 0.5).long()
-                acc = (preds.view(-1) == y).float().mean()
+        x, y = batch
+        logits = self(x)
+        if (self.hparams.loss_function == "bce_single_logit"
+            and self.num_classes == 1
+            and self.loss_fn is not None):
+            y_float = y.float().unsqueeze(1)
+            loss = self.loss_fn(logits, y_float)
+            prob = torch.sigmoid(logits)
+            preds = (prob >= 0.5).long()
+            acc = (preds.view(-1) == y).float().mean()
+        else:
+            if self.loss_fn is None:
+                loss = self._compute_loss(logits, y)
             else:
-                if self.loss_fn is None:
-                    loss = self._compute_loss(logits, y)
-                else:
-                    loss = self._compute_loss_custom(logits, y)
-                preds = torch.argmax(logits, dim=1)
-                acc = (preds == y).float().mean()
+                loss = self._compute_loss_custom(logits, y)
+            preds = torch.argmax(logits, dim=1)
+            acc = (preds == y).float().mean()
 
         self.log("val_loss", loss, on_epoch=True, prog_bar=True)
         self.log("val_acc", acc, on_epoch=True, prog_bar=True)
         return {"val_loss": loss, "val_acc": acc}
 
     def test_step(self, batch, batch_idx):
-        with torch.no_grad():
-            x, y = batch
-            logits = self._forward_tta(x) if self.enable_tta else self(x)
-
-            if (self.loss_function == "bce_single_logit"
-                    and self.num_classes == 1
-                    and self.loss_fn is not None):
-                y_float = y.float().unsqueeze(1)
-                loss = self.loss_fn(logits, y_float)
-                prob = torch.sigmoid(logits)
-                preds = (prob >= 0.5).long()
-                acc = (preds.view(-1) == y).float().mean()
+        x, y = batch
+        logits = self._forward_tta(x) if self.enable_tta else self(x)
+        if (self.hparams.loss_function == "bce_single_logit"
+            and self.num_classes == 1
+            and self.loss_fn is not None):
+            y_float = y.float().unsqueeze(1)
+            loss = self.loss_fn(logits, y_float)
+            prob = torch.sigmoid(logits)
+            preds = (prob >= 0.5).long()
+            acc = (preds.view(-1) == y).float().mean()
+        else:
+            if self.loss_fn is None:
+                loss = self._compute_loss(logits, y)
             else:
-                if self.loss_fn is None:
-                    loss = self._compute_loss(logits, y)
-                else:
-                    loss = self._compute_loss_custom(logits, y)
-                preds = torch.argmax(logits, dim=1)
-                acc = (preds == y).float().mean()
+                loss = self._compute_loss_custom(logits, y)
+            preds = torch.argmax(logits, dim=1)
+            acc = (preds == y).float().mean()
 
         self.log("test_loss", loss, on_epoch=True, prog_bar=True)
         self.log("test_acc", acc, on_epoch=True, prog_bar=True)
         return {"test_loss": loss, "test_acc": acc}
 
     def _forward_tta(self, x: torch.Tensor) -> torch.Tensor:
-        # Basic TTA: average predictions of [original, h-flip, v-flip]
+        """Simple TTA: average predictions of [original, h-flip, v-flip]."""
         with torch.no_grad():
             logits_list = []
             logits_list.append(self(x))
@@ -755,25 +849,34 @@ class MaidClassifier(pl.LightningModule):
         warmup_epochs = self.scheduler_params.pop("warmup_epochs", 0)
         monitor_metric = self.scheduler_params.pop("monitor", "val_loss")
 
-        if self.optimizer_name.lower() == "adam":
+        opt_name = self.optimizer_name.lower()
+        if opt_name == "adam":
             optimizer = torch.optim.Adam(
                 self.parameters(), lr=self.lr, weight_decay=self.weight_decay
             )
-        elif self.optimizer_name.lower() == "sgd":
+        elif opt_name == "sgd":
             optimizer = torch.optim.SGD(
                 self.parameters(),
                 lr=self.lr,
                 momentum=self.momentum,
                 weight_decay=self.weight_decay
             )
-        elif self.optimizer_name.lower() == "adamw":
+        elif opt_name == "adamw":
             optimizer = torch.optim.AdamW(
                 self.parameters(), lr=self.lr, weight_decay=self.weight_decay
             )
-        elif self.optimizer_name.lower() == "lamb":
+        elif opt_name == "lamb":
             if not HAVE_LAMB:
-                raise ImportError("LAMB optimizer not available. Please install pytorch-optimizer.")
-            optimizer = LambClass(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+                raise ImportError("LAMB optimizer not available. Install pytorch-optimizer.")
+            optimizer = LambClass(
+                self.parameters(), lr=self.lr, weight_decay=self.weight_decay
+            )
+        elif opt_name == "lion":
+            if not HAVE_LION:
+                raise ImportError("Lion optimizer not available. Install pytorch-optimizer.")
+            optimizer = LionClass(
+                self.parameters(), lr=self.lr, weight_decay=self.weight_decay
+            )
         else:
             raise ValueError(f"Unknown optimizer: {self.optimizer_name}")
 
@@ -836,8 +939,6 @@ class MaidClassifier(pl.LightningModule):
 
     def _compute_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         if self.use_weighted_loss and (self.class_weights is not None):
-            if any(w == 0 for w in self.class_weights):
-                logger.warning("Some class weights are zero; check dataset distribution.")
             wt = torch.tensor(self.class_weights, device=logits.device, dtype=torch.float32)
             return F.cross_entropy(
                 logits, targets, weight=wt, label_smoothing=self.label_smoothing
@@ -855,61 +956,25 @@ class MaidClassifier(pl.LightningModule):
         else:
             return self._compute_loss(logits, targets)
 
-    def export_onnx(self, onnx_path: str = "model.onnx",
-                    input_size: Tuple[int, int, int, int] = (1, 3, 224, 224)):
-        dummy_input = torch.randn(input_size, device=self.device)
-        self.eval()
-        torch.onnx.export(self, dummy_input, onnx_path, export_params=True)
-        logger.info(f"Model exported to ONNX: {onnx_path}")
 
-    def export_torchscript(self, ts_path: str = "model.ts",
-                           input_size: Tuple[int, int, int, int] = (1, 3, 224, 224)):
-        dummy_input = torch.randn(input_size, device=self.device)
-        self.eval()
-        traced = torch.jit.trace(self, dummy_input)
-        traced.save(ts_path)
-        logger.info(f"Model exported to TorchScript: {ts_path}")
-
-    def export_tensorrt(self, trt_path: str = "model.trt",
-                        input_size: Tuple[int, int, int, int] = (1, 3, 224, 224)):
-        logger.info("TensorRT export is not implemented.")
-        pass
-
-
-# ----------------------------------
-# PARTIAL FREEZE (ARCH-SPECIFIC)
-# ----------------------------------
 def apply_partial_freeze(model: MaidClassifier, freeze_config: Dict[str, bool]):
-    """
-    Dynamically freeze certain submodules based on freeze_config, supporting
-    ResNet (conv1_bn1, layer1..4) and ConvNeXt (block0..3) in a single set of
-    checkboxes. If the user checks e.g. 'conv1_bn1' but the architecture is
-    ConvNeXt, we do nothing.
-
-    If 'freeze_entire_backbone' is True, we freeze all backbone parameters
-    and ignore the per-layer flags.
-    """
     if model.custom_model is not None:
-        logger.info("Skipping partial freeze because a custom model was loaded.")
+        print("[INFO] Skipping partial freeze because a custom model was loaded.")
         return
 
     if not model.backbone:
-        # Possibly custom model has no backbone
         return
 
     if freeze_config.get("freeze_entire_backbone", False):
         for param in model.backbone.parameters():
             param.requires_grad = False
-        logger.info("Froze the entire backbone.")
+        print("[INFO] Froze the entire backbone.")
         return
 
     arch = model.hparams["architecture"].lower()
 
-    # -------------------
-    # FOR RESNET:
-    # -------------------
+    # For ResNet
     if arch.startswith("resnet"):
-        # If conv1_bn1 is checked, freeze conv1 + bn1
         if freeze_config.get("conv1_bn1", False):
             if hasattr(model.backbone, "conv1"):
                 for p in model.backbone.conv1.parameters():
@@ -917,64 +982,49 @@ def apply_partial_freeze(model: MaidClassifier, freeze_config: Dict[str, bool]):
             if hasattr(model.backbone, "bn1"):
                 for p in model.backbone.bn1.parameters():
                     p.requires_grad = False
-            logger.info("Froze conv1 + bn1 (ResNet).")
+            print("[INFO] Froze conv1 + bn1 (ResNet).")
 
-        # For layer1..layer4
         for layer_name in ["layer1", "layer2", "layer3", "layer4"]:
             if freeze_config.get(layer_name, False):
                 layer_mod = getattr(model.backbone, layer_name, None)
                 if layer_mod is not None:
                     for p in layer_mod.parameters():
                         p.requires_grad = False
-                    logger.info(f"Froze {layer_name} (ResNet).")
+                    print(f"[INFO] Froze {layer_name} (ResNet).")
 
-    # -------------------
-    # FOR CONVNEXT:
-    # We interpret "block0..3" as model.backbone.features[0..3]
-    # -------------------
+    # For ConvNeXt
     elif arch.startswith("convnext"):
         if hasattr(model.backbone, "features"):
             feats = model.backbone.features
-            # block0 => features[0]
             if freeze_config.get("block0", False) and len(feats) > 0:
                 for p in feats[0].parameters():
                     p.requires_grad = False
-                logger.info("Froze block0 (ConvNeXt).")
+                print("[INFO] Froze block0 (ConvNeXt).")
             if freeze_config.get("block1", False) and len(feats) > 1:
                 for p in feats[1].parameters():
                     p.requires_grad = False
-                logger.info("Froze block1 (ConvNeXt).")
+                print("[INFO] Froze block1 (ConvNeXt).")
             if freeze_config.get("block2", False) and len(feats) > 2:
                 for p in feats[2].parameters():
                     p.requires_grad = False
-                logger.info("Froze block2 (ConvNeXt).")
+                print("[INFO] Froze block2 (ConvNeXt).")
             if freeze_config.get("block3", False) and len(feats) > 3:
                 for p in feats[3].parameters():
                     p.requires_grad = False
-                logger.info("Froze block3 (ConvNeXt).")
+                print("[INFO] Froze block3 (ConvNeXt).")
 
-    # If user selected e.g. "conv1_bn1" but arch is not ResNet, we just ignore it
-    # (no error). Similarly for "block0" if not a ConvNeXt, etc.
-
-
-class CollateFnWrapper:
-    def __init__(self, use_mixup: bool = False, use_cutmix: bool = False, alpha: float = 1.0):
-        self.use_mixup = use_mixup
-        self.use_cutmix = use_cutmix
-        self.alpha = alpha
-
-    def __call__(self, batch):
-        return custom_collate_fn(batch, self.use_mixup, self.use_cutmix, self.alpha)
+    # For CoAtNet in timm or other partial freeze
+    elif arch.startswith("coatnet_"):
+        pass
 
 
 # ============================
-# 6) CALLBACKS & TRAIN LOOPS
+# 6) TRAINING CALLBACKS
 # ============================
 class ProgressCallback(Callback):
     """
-    A callback to log progress each epoch,
-    optionally run garbage collection,
-    and optionally profile memory usage.
+    Logs progress each epoch, optionally runs GC,
+    and optionally profiles memory usage.
     """
     def __init__(self, total_epochs: int, run_gc: bool = False, profile_memory: bool = False):
         super().__init__()
@@ -985,7 +1035,7 @@ class ProgressCallback(Callback):
 
     def on_fit_start(self, trainer, pl_module):
         self.start_time = time.time()
-        logger.info("Training started...")
+        print("[INFO] Training started...")
 
     def on_train_epoch_end(self, trainer, pl_module):
         current_epoch = trainer.current_epoch + 1
@@ -997,127 +1047,53 @@ class ProgressCallback(Callback):
         else:
             eta = 0.0
 
-        metric_msg = (
-            f"Epoch {current_epoch}/{self.total_epochs} "
-            f"- ETA: {eta:.2f}s "
-            f"- Train Loss: {trainer.callback_metrics.get('train_loss', 'N/A')}, "
-            f"Val Loss: {trainer.callback_metrics.get('val_loss', 'N/A')}, "
-            f"Val Acc: {trainer.callback_metrics.get('val_acc', 'N/A')}"
+        train_loss = trainer.callback_metrics.get("train_loss", "N/A")
+        val_loss = trainer.callback_metrics.get("val_loss", "N/A")
+        val_acc = trainer.callback_metrics.get("val_acc", "N/A")
+        msg = (
+            f"[EPOCH {current_epoch}/{self.total_epochs}] "
+            f"ETA: {eta:.1f}s | train_loss={train_loss}, val_loss={val_loss}, val_acc={val_acc}"
         )
-        logger.info(metric_msg)
+        print(msg)
 
-        # Clear CUDA memory if requested
         if self.run_gc:
             gc.collect()
             torch.cuda.empty_cache()
 
         if self.profile_memory and torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated() / (1024**2)
-            logger.info(f"[Memory Profile] GPU allocated: {allocated:.2f} MB")
+            print(f"[MEM] GPU allocated: {allocated:.2f} MB")
 
 
+# ============================
+# 7) MAIN TRAINING FUNCTION
+# ============================
 def run_training_once(
     data_params: DataConfig,
     train_params: TrainConfig
 ) -> Tuple[str, Dict[str, Any], Optional[float]]:
-    """
-    Perform a single training run using the given configs.
-    Returns (best_ckpt_path, test_metrics, val_loss).
-    """
-    root_dir = data_params.root_dir
-    val_split = data_params.val_split
-    test_split = data_params.test_split
-    batch_size = data_params.batch_size
-    allow_grayscale = data_params.allow_grayscale
+    seed_everything(42, workers=True)
 
-    if val_split + test_split > 1.0:
-        raise ValueError("Combined val+test split cannot exceed 1.0")
-
-    # Basic fields
-    max_epochs = train_params.max_epochs
-    architecture = train_params.architecture
-    lr = train_params.lr
-    momentum = train_params.momentum
-    weight_decay = train_params.weight_decay
-    use_weighted_loss = train_params.use_weighted_loss
-    optimizer_name = train_params.optimizer_name
-    scheduler_name = train_params.scheduler_name
-    scheduler_params = dict(train_params.scheduler_params)
-    do_early_stopping = train_params.do_early_stopping
-    early_stopping_monitor = train_params.early_stopping_monitor
-    early_stopping_patience = train_params.early_stopping_patience
-    early_stopping_min_delta = train_params.early_stopping_min_delta
-    early_stopping_mode = train_params.early_stopping_mode
-
-    brightness_contrast = train_params.brightness_contrast
-    hue_saturation = train_params.hue_saturation
-    gaussian_noise = train_params.gaussian_noise
-    rotation = train_params.use_rotation
-    flip = train_params.use_flip
-    flip_mode = train_params.flip_mode
-    flip_prob = train_params.flip_prob
-    crop = train_params.use_crop
-    elastic = train_params.use_elastic
-    normalize_pixel_intensity = train_params.normalize_pixel_intensity
-    use_grid_distortion = train_params.use_grid_distortion
-    use_optical_distortion = train_params.use_optical_distortion
-    use_mixup = train_params.use_mixup
-    use_cutmix = train_params.use_cutmix
-    mix_alpha = train_params.mix_alpha
-
-    dropout_rate = train_params.dropout_rate
-    label_smoothing = train_params.label_smoothing
-    freeze_backbone = train_params.freeze_backbone
-    loss_function = train_params.loss_function
-
-    gradient_clip_val = train_params.gradient_clip_val
-    use_lr_finder = train_params.use_lr_finder
-    use_tensorboard = train_params.use_tensorboard
-    use_mixed_precision = train_params.use_mixed_precision
-    warmup_epochs = train_params.warmup_epochs
-    use_inception_299 = train_params.use_inception_299
-
-    enable_gradient_checkpointing = train_params.enable_gradient_checkpointing
-    enable_grad_accum = train_params.enable_grad_accum
-    accumulate_grad_batches = train_params.accumulate_grad_batches
-    check_val_every_n_epoch = train_params.check_val_every_n_epoch
-
-    freeze_config = train_params.freeze_config
-    num_workers = train_params.num_workers
-    val_center_crop = train_params.val_center_crop
-    accept_lr_suggestion = train_params.accept_lr_suggestion
-    random_crop_prob = train_params.random_crop_prob
-    random_crop_scale_min = train_params.random_crop_scale_min
-    random_crop_scale_max = train_params.random_crop_scale_max
-
-    pretrained_weights = train_params.pretrained_weights
-    run_gc = train_params.run_gc
-    enable_tta = train_params.enable_tta
-    profile_memory = train_params.profile_memory
-
-    load_custom_model = train_params.load_custom_model
-    custom_model_path = train_params.custom_model_path
-    custom_arch_file = train_params.custom_architecture_file
-
-    logger.info("Gathering samples...")
-    samples, class_names = gather_samples_and_classes(root_dir)
+    print("[INFO] Gathering samples...")
+    samples, class_names = gather_samples_and_classes(data_params.root_dir)
     n_total = len(samples)
     if n_total < 2:
         raise ValueError("Dataset has insufficient images.")
-    logger.info(f"Found {n_total} total images across classes.")
 
-    # Stratified splits
+    print(f"[INFO] Found {n_total} images among {len(class_names)} classes: {class_names}")
+
+    # Split into train/val/test
     targets = [lbl for _, lbl in samples]
-    sss_test = StratifiedShuffleSplit(n_splits=1, test_size=test_split, random_state=42)
+    sss_test = StratifiedShuffleSplit(n_splits=1, test_size=data_params.test_split, random_state=42)
     trainval_index, test_index = next(sss_test.split(np.arange(n_total), targets))
-
     trainval_samples = [samples[i] for i in trainval_index]
     trainval_targets = [targets[i] for i in trainval_index]
 
-    if val_split > 0.0:
+    if data_params.val_split > 0:
+        val_ratio = data_params.val_split
         sss_val = StratifiedShuffleSplit(
             n_splits=1,
-            test_size=val_split / (1.0 - test_split),
+            test_size=val_ratio / (1.0 - data_params.test_split),
             random_state=42
         )
         train_index, val_index = next(sss_val.split(trainval_samples, trainval_targets))
@@ -1129,579 +1105,587 @@ def run_training_once(
     val_samples = [trainval_samples[i] for i in val_index]
     test_samples = [samples[i] for i in test_index]
 
-    logger.info(f"Splits => Train: {len(train_samples)}, Val: {len(val_samples)}, Test: {len(test_samples)}")
+    print(f"[INFO] Splits => Train: {len(train_samples)}, "
+          f"Val: {len(val_samples)}, Test: {len(test_samples)}")
+
     num_classes = len(class_names)
-    logger.info(f"Detected {num_classes} classes: {class_names}")
-
-    class_weights = None
-    if use_weighted_loss and (loss_function != "bce_single_logit"):
-        # Weighted CE scenario
-        all_labels = [lbl for _, lbl in samples]
-        label_counter = Counter(all_labels)
-        freq = [label_counter[i] for i in range(num_classes)]
-        if any(c == 0 for c in freq):
-            logger.warning("One or more classes have zero samples.")
-        class_weights = [1.0 / c if c > 0 else 0.0 for c in freq]
-        logger.info(f"Using Weighted Loss: {class_weights}")
-
-    if loss_function == "bce_single_logit":
+    if train_params.loss_function == "bce_single_logit":
         model_num_classes = 1
     else:
         model_num_classes = num_classes
 
-    scheduler_params["warmup_epochs"] = warmup_epochs
-    scheduler_params["monitor"] = early_stopping_monitor
+    # Weighted loss?
+    class_weights = None
+    if train_params.use_weighted_loss and train_params.loss_function != "bce_single_logit":
+        all_labels = [lbl for _, lbl in samples]
+        freq = [all_labels.count(i) for i in range(num_classes)]
+        class_weights = [1.0 / c if c > 0 else 0.0 for c in freq]
+        print(f"[INFO] Using weighted loss: {class_weights}")
 
-    # Construct model
+    # Build model
     model = MaidClassifier(
-        architecture=architecture,
+        architecture=train_params.architecture,
         num_classes=model_num_classes,
-        lr=lr,
-        momentum=momentum,
-        weight_decay=weight_decay,
-        use_weighted_loss=use_weighted_loss,
+        lr=train_params.lr,
+        momentum=train_params.momentum,
+        weight_decay=train_params.weight_decay,
+        use_weighted_loss=train_params.use_weighted_loss,
         class_weights=class_weights,
-        optimizer_name=optimizer_name,
-        scheduler_name=scheduler_name,
-        scheduler_params=scheduler_params,
-        dropout_rate=dropout_rate,
-        label_smoothing=label_smoothing,
-        freeze_backbone=freeze_backbone,
-        loss_function=loss_function,
-        pretrained=pretrained_weights,
-        enable_tta=enable_tta,
-        load_custom_model=load_custom_model,
-        custom_model_path=custom_model_path,
-        custom_architecture_file=custom_arch_file
+        optimizer_name=train_params.optimizer_name,
+        scheduler_name=train_params.scheduler_name,
+        scheduler_params=train_params.scheduler_params,
+        dropout_rate=train_params.dropout_rate,
+        label_smoothing=train_params.label_smoothing,
+        freeze_backbone=train_params.freeze_backbone,
+        loss_function=train_params.loss_function,
+        pretrained=train_params.pretrained_weights,
+        enable_tta=train_params.enable_tta,
+        load_custom_model=train_params.load_custom_model,
+        custom_model_path=train_params.custom_model_path,
+        custom_architecture_file=train_params.custom_architecture_file
     )
     model.class_names = class_names
-    apply_partial_freeze(model, freeze_config)
+    apply_partial_freeze(model, train_params.freeze_config)
 
-    if enable_gradient_checkpointing:
+    if train_params.enable_gradient_checkpointing:
         try:
             model.enable_gradient_checkpointing()
         except Exception as e:
-            logger.warning(f"Could not enable gradient checkpointing: {e}")
+            print(f"[WARN] Could not enable gradient checkpointing: {e}")
 
+    # Callbacks
     ckpt_callback = ModelCheckpoint(
-        monitor=early_stopping_monitor,
+        monitor=train_params.early_stopping_monitor,
         save_top_k=1,
-        mode=early_stopping_mode,
+        mode=train_params.early_stopping_mode,
         filename="best-checkpoint"
     )
     callbacks = [ckpt_callback]
 
-    if do_early_stopping:
+    if train_params.do_early_stopping:
         early_stop = EarlyStopping(
-            monitor=early_stopping_monitor,
-            patience=early_stopping_patience,
-            min_delta=early_stopping_min_delta,
-            mode=early_stopping_mode
+            monitor=train_params.early_stopping_monitor,
+            patience=train_params.early_stopping_patience,
+            min_delta=train_params.early_stopping_min_delta,
+            mode=train_params.early_stopping_mode
         )
         callbacks.append(early_stop)
 
     progress_cb = ProgressCallback(
-        total_epochs=max_epochs,
-        run_gc=run_gc,
-        profile_memory=profile_memory
+        total_epochs=train_params.max_epochs,
+        run_gc=train_params.run_gc,
+        profile_memory=train_params.profile_memory
     )
     callbacks.append(progress_cb)
 
     logger_obj = None
     tb_log_dir = None
-    if use_tensorboard:
+    if train_params.use_tensorboard:
         logger_obj = TensorBoardLogger(save_dir="tb_logs", name="experiment")
         tb_log_dir = logger_obj.log_dir
 
     trainer_device = "gpu" if torch.cuda.is_available() else "cpu"
     devices_to_use = torch.cuda.device_count() if torch.cuda.is_available() else 1
 
-    logger.info("Initializing Trainer...")
     trainer = Trainer(
-        max_epochs=max_epochs,
+        max_epochs=train_params.max_epochs,
         accelerator=trainer_device,
         devices=devices_to_use,
         callbacks=callbacks,
         logger=logger_obj,
-        gradient_clip_val=gradient_clip_val,
-        precision=16 if use_mixed_precision and torch.cuda.is_available() else 32,
-        accumulate_grad_batches=accumulate_grad_batches if enable_grad_accum else 1,
-        check_val_every_n_epoch=check_val_every_n_epoch,
+        gradient_clip_val=train_params.gradient_clip_val,
+        precision=16 if (train_params.use_mixed_precision and torch.cuda.is_available()) else 32,
+        accumulate_grad_batches=train_params.accumulate_grad_batches if train_params.enable_grad_accum else 1,
+        check_val_every_n_epoch=train_params.check_val_every_n_epoch,
         enable_progress_bar=True
     )
 
-    # Decide final crop dimension
-    if architecture.lower() == "inception" and use_inception_299:
+    # Decide final image size
+    if train_params.architecture.lower() == "inception" and train_params.use_inception_299:
         final_crop_dim = 299
         bigger_resize = 320
     else:
         final_crop_dim = 224
         bigger_resize = 256
 
-    # Collate with MixUp/CutMix
-    collate_fn = None
-    if use_mixup or use_cutmix:
-        collate_fn = CollateFnWrapper(use_mixup=use_mixup, use_cutmix=use_cutmix, alpha=mix_alpha)
-
     # Albumentations transforms
-    train_augs = []
-    if rotation:
-        train_augs.append(A.Rotate(limit=30, p=0.5))
-    if flip:
-        if flip_mode == "horizontal":
-            train_augs.append(A.HorizontalFlip(p=flip_prob))
-        elif flip_mode == "vertical":
-            train_augs.append(A.VerticalFlip(p=flip_prob))
-        elif flip_mode == "both":
-            train_augs.append(
-                A.OneOf([
-                    A.HorizontalFlip(p=1.0),
-                    A.VerticalFlip(p=1.0)
-                ], p=flip_prob)
-            )
-    if crop:
-        train_augs.append(
+    aug_list = []
+    if train_params.use_crop:
+        aug_list.append(
             A.RandomResizedCrop(
-                (final_crop_dim, final_crop_dim),
-                scale=(random_crop_scale_min, random_crop_scale_max),
-                p=random_crop_prob
+                size=(final_crop_dim, final_crop_dim),
+                scale=(train_params.random_crop_scale_min, train_params.random_crop_scale_max),
+                ratio=(0.75, 1.3333),
+                interpolation=cv2.INTER_LINEAR,
+                p=train_params.random_crop_prob
             )
         )
     else:
-        train_augs.append(A.Resize(final_crop_dim, final_crop_dim))
-
-    if elastic:
-        train_augs.append(A.ElasticTransform(p=0.2))
-    if brightness_contrast:
-        train_augs.append(A.RandomBrightnessContrast(p=0.5))
-    if hue_saturation:
-        train_augs.append(A.HueSaturationValue(p=0.5))
-    if gaussian_noise:
-        train_augs.append(A.GaussNoise(p=0.3))
-    if use_grid_distortion:
-        train_augs.append(A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.3))
-    if use_optical_distortion:
-        train_augs.append(A.OpticalDistortion(distort_limit=0.3, shift_limit=0.2, p=0.3))
-
-    if normalize_pixel_intensity:
-        train_augs.append(
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+        aug_list.append(
+            A.Resize(
+                height=final_crop_dim,
+                width=final_crop_dim,
+                interpolation=cv2.INTER_LINEAR,
+                p=1.0
+            )
         )
-    train_augs.append(ToTensorV2())
-    train_transform = A.Compose(train_augs)
 
-    val_augs = [
-        A.Resize(bigger_resize, bigger_resize)
-    ]
-    if val_center_crop:
-        val_augs.append(A.CenterCrop(final_crop_dim, final_crop_dim, p=1.0))
-    if normalize_pixel_intensity:
-        val_augs.append(
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+    if train_params.brightness_contrast:
+        aug_list.append(A.RandomBrightnessContrast(p=0.5))
+    if train_params.hue_saturation:
+        aug_list.append(A.HueSaturationValue(p=0.5))
+    if train_params.gaussian_noise:
+        aug_list.append(A.GaussNoise(p=0.5))
+    if train_params.use_rotation:
+        aug_list.append(A.Rotate(limit=30, p=0.5))
+
+    if train_params.use_flip:
+        if train_params.flip_mode == "horizontal":
+            aug_list.append(A.HorizontalFlip(p=train_params.flip_prob))
+        elif train_params.flip_mode == "vertical":
+            aug_list.append(A.VerticalFlip(p=train_params.flip_prob))
+        else:
+            aug_list.append(
+                A.OneOf([
+                    A.HorizontalFlip(p=1.0),
+                    A.VerticalFlip(p=1.0),
+                ], p=train_params.flip_prob)
+            )
+
+    if train_params.use_elastic:
+        aug_list.append(A.ElasticTransform(p=0.5))
+    if train_params.use_grid_distortion:
+        aug_list.append(A.GridDistortion(p=0.5))
+    if train_params.use_optical_distortion:
+        aug_list.append(A.OpticalDistortion(p=0.5))
+
+    # Advanced augs
+    if train_params.random_gamma:
+        aug_list.append(
+            A.RandomGamma(
+                gamma_limit=(train_params.random_gamma_limit_low, train_params.random_gamma_limit_high),
+                p=train_params.random_gamma_prob
+            )
         )
+    if train_params.clahe:
+        aug_list.append(
+            A.CLAHE(
+                clip_limit=train_params.clahe_clip_limit,
+                tile_grid_size=(train_params.clahe_tile_size, train_params.clahe_tile_size),
+                p=train_params.clahe_prob
+            )
+        )
+    if train_params.channel_shuffle:
+        aug_list.append(A.ChannelShuffle(p=train_params.channel_shuffle_prob))
+
+    if train_params.use_posterize_solarize_equalize:
+        aug_list.append(
+            A.OneOf([
+                A.Posterize(num_bits=train_params.posterize_bits, p=1.0),
+                A.Solarize(threshold=train_params.solarize_threshold, p=1.0),
+                A.Equalize(p=1.0),
+            ], p=train_params.pse_prob)
+        )
+
+    if train_params.sharpen_denoise:
+        aug_list.append(
+            A.Sharpen(
+                alpha=(train_params.sharpen_alpha_min, train_params.sharpen_alpha_max),
+                lightness=(train_params.sharpen_lightness_min, train_params.sharpen_lightness_max),
+                p=train_params.sharpen_prob
+            )
+        )
+
+    if train_params.gauss_vs_mult_noise:
+        aug_list.append(
+            A.OneOf([
+                A.GaussNoise(
+                    var_limit=(train_params.gauss_noise_var_limit_low, train_params.gauss_noise_var_limit_high),
+                    p=1.0
+                ),
+                A.MultiplicativeNoise(
+                    multiplier=(train_params.mult_noise_lower, train_params.mult_noise_upper),
+                    p=1.0
+                ),
+            ], p=train_params.gauss_mult_prob)
+        )
+
+    if train_params.cutout_coarse_dropout:
+        aug_list.append(
+            A.CoarseDropout(
+                max_holes=train_params.cutout_max_holes,
+                max_height=train_params.cutout_max_height,
+                max_width=train_params.cutout_max_width,
+                fill_value=0,
+                p=train_params.cutout_prob
+            )
+        )
+
+    if train_params.use_shift_scale_rotate:
+        aug_list.append(
+            A.ShiftScaleRotate(
+                shift_limit=train_params.ssr_shift_limit,
+                scale_limit=train_params.ssr_scale_limit,
+                rotate_limit=train_params.ssr_rotate_limit,
+                p=train_params.ssr_prob
+            )
+        )
+
+    if train_params.use_one_of_advanced_transforms:
+        adv_candidates = [
+            A.RandomFog(p=1.0),
+            A.RandomRain(p=1.0),
+            A.GaussianBlur(p=1.0),
+        ]
+        aug_list.append(A.OneOf(adv_candidates, p=train_params.one_of_advanced_transforms_prob))
+
+    # RandAugment if CoAtNet + user requests
+    if train_params.architecture.lower().startswith("coatnet_") and train_params.use_randaugment:
+        if hasattr(A, "RandAugment"):
+            aug_list.append(A.RandAugment(num_ops=2, magnitude=9, p=1.0))
+        else:
+            print("[WARN] Albumentations RandAugment is not available. Please update Albumentations.")
+
+    if train_params.normalize_pixel_intensity:
+        aug_list.append(A.Normalize(mean=(0.485, 0.456, 0.406),
+                                    std=(0.229, 0.224, 0.225), p=1.0))
+
+    aug_list.append(ToTensorV2())
+    train_transform = A.Compose(aug_list)
+
+    # Validation transform
+    val_augs = []
+    val_augs.append(
+        A.Resize(
+            height=bigger_resize,
+            width=bigger_resize,
+            interpolation=cv2.INTER_LINEAR,
+            p=1.0
+        )
+    )
+    if train_params.val_center_crop:
+        val_augs.append(A.CenterCrop(height=final_crop_dim, width=final_crop_dim))
+    if train_params.normalize_pixel_intensity:
+        val_augs.append(A.Normalize(mean=(0.485, 0.456, 0.406),
+                                    std=(0.229, 0.224, 0.225)))
     val_augs.append(ToTensorV2())
     val_transform = A.Compose(val_augs)
 
-    test_augs = [
-        A.Resize(bigger_resize, bigger_resize)
-    ]
-    if val_center_crop:
-        test_augs.append(A.CenterCrop(final_crop_dim, final_crop_dim, p=1.0))
-    if normalize_pixel_intensity:
-        test_augs.append(
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
-        )
-    test_augs.append(ToTensorV2())
-    test_transform = A.Compose(test_augs)
-
     train_ds = AlbumentationsDataset(
-        train_samples,
-        transform=train_transform,
-        classes=class_names,
-        allow_grayscale=allow_grayscale
+        train_samples, transform=train_transform,
+        classes=class_names, allow_grayscale=data_params.allow_grayscale
     )
     val_ds = AlbumentationsDataset(
-        val_samples,
-        transform=val_transform,
-        classes=class_names,
-        allow_grayscale=allow_grayscale
+        val_samples, transform=val_transform,
+        classes=class_names, allow_grayscale=data_params.allow_grayscale
     )
     test_ds = AlbumentationsDataset(
-        test_samples,
-        transform=test_transform,
-        classes=class_names,
-        allow_grayscale=allow_grayscale
+        test_samples, transform=val_transform,
+        classes=class_names, allow_grayscale=data_params.allow_grayscale
     )
+
+    # Determine if we can enable persistent_workers (requires num_workers>0)
+    persistent_workers = train_params.persistent_workers and (train_params.num_workers > 0)
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=batch_size,
+        batch_size=data_params.batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=2,
-        collate_fn=collate_fn
+        num_workers=train_params.num_workers,
+        pin_memory=False,
+        persistent_workers=persistent_workers
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=batch_size,
+        batch_size=data_params.batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=train_params.num_workers,
         pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=2
+        persistent_workers=persistent_workers
     )
     test_loader = DataLoader(
         test_ds,
-        batch_size=batch_size,
+        batch_size=data_params.batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=train_params.num_workers,
         pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=2
+        persistent_workers=persistent_workers
     )
 
-    # LR Finder if requested
-    if use_lr_finder:
-        logger.info("Running LR finder...")
+    # LR finder if requested
+    if train_params.use_lr_finder:
         tuner = Tuner(trainer)
         lr_finder = tuner.lr_find(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
-        new_lr = lr_finder.suggestion()
-        logger.info(f"LR Finder suggests learning rate: {new_lr}")
-        if accept_lr_suggestion:
-            logger.info(f"Applying LR Finder suggestion: {new_lr}")
-            model.lr = new_lr
-        else:
-            logger.info("User declined LR suggestion. Keeping original LR.")
+        suggested_lr = lr_finder.suggestion()
+        print(f"[LR FINDER] Suggested LR: {suggested_lr}")
+        if train_params.accept_lr_suggestion:
+            model.lr = suggested_lr
+            print(f"[LR FINDER] Updated model.lr to {suggested_lr}")
 
     # Train
-    logger.info(f"Starting training with batch_size={batch_size} on {trainer_device} (devices={devices_to_use})...")
     trainer.fit(model, train_loader, val_loader)
-    logger.info("Training finished.")
 
-    best_ckpt_path = ckpt_callback.best_model_path
-    logger.info(f"Best checkpoint: {best_ckpt_path}")
+    # === LOAD BEST CHECKPOINT AND USE FOR FINAL VAL/TEST ===
+    best_checkpoint_path = ckpt_callback.best_model_path
+    print(f"[INFO] Validating & testing best checkpoint from: {best_checkpoint_path}")
+    best_model = MaidClassifier.load_from_checkpoint(best_checkpoint_path)
 
-    val_results = trainer.validate(model, val_loader, ckpt_path=best_ckpt_path)
-    val_loss = val_results[0]["val_loss"] if len(val_results) > 0 else None
-
-    logger.info("Running test...")
-    test_results = trainer.test(ckpt_path=best_ckpt_path, dataloaders=test_loader)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    best_model = MaidClassifier.load_from_checkpoint(best_ckpt_path)
+    # Copy class_names and relevant hparams to best_model so it can do TTA or other steps
     best_model.class_names = model.class_names
-    best_model.to(device)
-    best_model.eval()
+    best_model.hparams.enable_tta = model.hparams.enable_tta
 
+    # Evaluate on validation set
+    val_results = trainer.validate(best_model, val_loader, verbose=False)
+    final_val_loss = None
+    if len(val_results) > 0 and "val_loss" in val_results[0]:
+        final_val_loss = float(val_results[0]["val_loss"])
+
+    # Evaluate on test set
+    trainer.test(best_model, test_loader, verbose=False)
+    test_metrics_dict = {
+        "test_results": trainer.callback_metrics,
+        "confusion_matrix": None,
+        "class_report": None,
+        "auc_roc": None,
+        "tb_log_dir": tb_log_dir,
+        "cm_fig_path": None
+    }
+
+    # Gather predictions
+    best_model.eval()
     all_preds = []
     all_targets = []
-    all_probs = []
-
     with torch.no_grad():
-        for x, y in test_loader:
-            x = x.to(device)
-            y = y.to(device)
-            logits = best_model._forward_tta(x) if best_model.enable_tta else best_model(x)
+        for xb, yb in test_loader:
+            xb = xb.to(best_model.device)
+            yb = yb.to(best_model.device)
+            logits = best_model._forward_tta(xb) if best_model.hparams.enable_tta else best_model(xb)
 
-            if (best_model.loss_function == "bce_single_logit") and best_model.num_classes == 1:
-                prob = torch.sigmoid(logits)
-                preds = (prob >= 0.5).long().view(-1)
-                all_preds.extend(preds.cpu().numpy())
-                all_probs.extend(prob.view(-1).cpu().numpy())
+            if model_num_classes == 1 and train_params.loss_function == "bce_single_logit":
+                probs = torch.sigmoid(logits)
+                preds = (probs >= 0.5).long().view(-1)
             else:
-                probs = torch.softmax(logits, dim=1)
-                preds = torch.argmax(probs, dim=1)
-                all_preds.extend(preds.cpu().numpy())
-                all_probs.extend(probs.cpu().numpy())
-            all_targets.extend(y.cpu().numpy())
+                preds = torch.argmax(logits, dim=1)
+            all_preds.append(preds.cpu().numpy())
+            all_targets.append(yb.cpu().numpy())
 
-    all_preds = np.array(all_preds)
-    all_targets = np.array(all_targets)
-    all_probs = np.array(all_probs)
+    all_preds = np.concatenate(all_preds)
+    all_targets = np.concatenate(all_targets)
 
-    cm = None
-    cr = None
-    auc_roc = None
-    try:
-        unique_labels = np.unique(all_targets)
-        if len(unique_labels) < 2:
-            logger.warning("Only one class present in test set; skipping AUC computation.")
-            cm = confusion_matrix(all_targets, all_preds)
-            if (best_model.loss_function == "bce_single_logit") and best_model.num_classes == 1:
-                cr = classification_report(all_targets, all_preds, zero_division=0)
-            else:
-                cr = classification_report(
-                    all_targets, all_preds,
-                    target_names=best_model.class_names,
-                    zero_division=0
-                )
-        else:
-            if (best_model.loss_function == "bce_single_logit") and best_model.num_classes == 1:
-                cm = confusion_matrix(all_targets, all_preds)
-                cr = classification_report(all_targets, all_preds, zero_division=0)
-                auc_roc = roc_auc_score(all_targets, all_probs)
-            else:
-                cm = confusion_matrix(all_targets, all_preds)
-                cr = classification_report(
-                    all_targets, all_preds,
-                    target_names=best_model.class_names,
-                    zero_division=0
-                )
-                if best_model.num_classes == 2:
-                    auc_roc = roc_auc_score(all_targets, all_probs[:, 1])
-                else:
-                    auc_roc = roc_auc_score(
-                        all_targets, all_probs, multi_class='ovr', average='macro'
-                    )
-    except Exception as e:
-        logger.warning(f"Could not compute some metrics: {e}")
+    cm = confusion_matrix(all_targets, all_preds)
+    test_metrics_dict["confusion_matrix"] = cm.tolist()
 
-    if cm is not None:
-        logger.info(f"Confusion Matrix:\n{cm}")
-    if cr is not None:
-        logger.info(f"Classification Report:\n{cr}")
-    if auc_roc is not None:
-        logger.info(f"AUC-ROC: {auc_roc:.4f}")
+    cr = classification_report(all_targets, all_preds, target_names=class_names, zero_division=0)
+    test_metrics_dict["class_report"] = cr
 
-    # Optionally create a confusion matrix figure
-    cm_fig_path = None
-    if cm is not None and HAVE_MPL:
+    if HAVE_MPL:
+        fig_cm = plt.figure(figsize=(6, 6))
+        ax = fig_cm.add_subplot(1, 1, 1)
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                    xticklabels=class_names, yticklabels=class_names, ax=ax)
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("True")
+        fig_path = "confusion_matrix.png"
+        fig_cm.savefig(fig_path)
+        plt.close(fig_cm)
+        test_metrics_dict["cm_fig_path"] = os.path.abspath(fig_path)
+
+    print(f"[INFO] Finished training. Best checkpoint: {best_checkpoint_path}")
+    return best_checkpoint_path, test_metrics_dict, final_val_loss
+
+
+# ============================
+# 8) WORKER FUNCTIONS FOR MULTIPROCESS
+# ============================
+
+def _try_run_training(data_dict, train_dict):
+    """
+    Helper to run training once. Catches OOM error, returns results or raises.
+    """
+    data_config = DataConfig(**data_dict)
+    train_config = TrainConfig(**train_dict)
+    best_ckpt_path, test_metrics, val_loss = run_training_once(data_config, train_config)
+    return best_ckpt_path, test_metrics
+
+
+def _auto_adjust_batch_size(data_dict, train_dict, original_bs) -> (Optional[str], Optional[dict]):
+    """
+    Binary-search fallback for GPU OOM. Returns (ckpt_path, test_metrics) or (None, None) if fails.
+    """
+    low, high = 1, original_bs
+    feasible_bs = 1
+    best_ckpt_path = None
+    best_test_metrics = None
+
+    while low <= high:
+        mid = (low + high) // 2
+        data_dict["batch_size"] = mid
+        print(f"[INFO] Trying batch_size={mid} in fallback.")
         try:
-            fig, ax = plt.subplots(figsize=(6, 5))
-            sns.heatmap(cm, annot=True, fmt='d', cmap="Blues", ax=ax)
-            ax.set_xlabel("Predicted")
-            ax.set_ylabel("True")
-            plt.tight_layout()
-            cm_fig_path = "confusion_matrix.png"
-            fig.savefig(cm_fig_path)
-            plt.close(fig)
-            logger.info(f"Confusion matrix plot saved to {cm_fig_path}")
-        except Exception as e:
-            logger.warning(f"Failed to plot confusion matrix: {e}")
-
-    test_metrics = {
-        "test_results": test_results,
-        "confusion_matrix": cm.tolist() if cm is not None else None,
-        "class_report": cr,
-        "auc_roc": auc_roc,
-        "tb_log_dir": tb_log_dir,
-        "cm_fig_path": cm_fig_path
-    }
-    return best_ckpt_path, test_metrics, val_loss
-
-
-# =======================
-# 7) THREAD CLASSES
-# =======================
-class TrainThread(QThread):
-    log_signal = pyqtSignal(str)
-    done_signal = pyqtSignal(str, dict)
-
-    def __init__(self, data_params: Dict[str, Any], train_params: Dict[str, Any], parent=None):
-        super().__init__(parent)
-        self.data_params = data_params
-        self.train_params = train_params
-
-        # For binary-search batch-size fallback
-        self.original_bs = self.data_params["batch_size"]
-
-    def run(self):
-        try:
-            seed_everything(42, workers=True)
-            self._execute_training()
-        except (ValueError, ImportError, RuntimeError) as e:
-            err_msg = f"ERROR during training: {e}\n{traceback.format_exc()}"
-            self.log_signal.emit(err_msg)
-            self.done_signal.emit("ERROR", {})
-
-    def _execute_training(self):
-        data_config = DataConfig(**self.data_params)
-        train_config = TrainConfig(**self.train_params)
-        try:
-            best_ckpt_path, test_metrics, _ = run_training_once(
-                data_config, train_config
-            )
-            self.done_signal.emit(best_ckpt_path, test_metrics)
+            bcp, tmetrics = _try_run_training(data_dict, train_dict)
+            feasible_bs = mid
+            best_ckpt_path = bcp
+            best_test_metrics = tmetrics
+            low = mid + 1  # try bigger
         except RuntimeError as re:
             if "CUDA out of memory" in str(re):
-                self.log_signal.emit("GPU OOM encountered.\n")
-                self._auto_adjust_batch_size()
+                high = mid - 1
             else:
-                raise
+                print(f"[ERROR] Non-OOM error: {re}")
+                return None, None
 
-    def _auto_adjust_batch_size(self):
-        """
-        Perform a binary search for the maximum feasible batch size
-        between 1 and original_bs.
-        """
-        low, high = 1, self.original_bs
-        feasible_bs = 1
-        while low <= high:
-            mid = (low + high) // 2
-            self.data_params["batch_size"] = mid
-            self.log_signal.emit(
-                f"Trying batch_size={mid} in binary search.\n"
-            )
-            try:
-                best_ckpt_path, test_metrics, _ = run_training_once(
-                    DataConfig(**self.data_params),
-                    TrainConfig(**self.train_params)
-                )
-                feasible_bs = mid
-                low = mid + 1
-                # If successful, record result but try bigger
-            except RuntimeError as re:
-                if "CUDA out of memory" in str(re):
-                    high = mid - 1
-                else:
-                    # some other error
-                    self.log_signal.emit(f"Other error in attempt: {re}\n")
-                    break
+    if feasible_bs == 1 and low == 1 and best_ckpt_path is None:
+        print("[ERROR] Even batch_size=1 failed. Cannot train.")
+        return None, None
 
-        if feasible_bs == 1 and low == 1:
-            self.log_signal.emit(
-                "All attempts failed at batch_size=1. Training cannot proceed.\n"
-            )
-            self.done_signal.emit("ERROR", {})
-        else:
-            self.log_signal.emit(
-                f"Binary search found feasible batch_size={feasible_bs}.\n"
-            )
-            # Final run with that feasible batch size
-            self.data_params["batch_size"] = feasible_bs
-            try:
-                best_ckpt_path, test_metrics, _ = run_training_once(
-                    DataConfig(**self.data_params),
-                    TrainConfig(**self.train_params)
-                )
-                self.done_signal.emit(best_ckpt_path, test_metrics)
-            except Exception as e:
-                err_msg = f"ERROR (final attempt) during training: {e}\n{traceback.format_exc()}"
-                self.log_signal.emit(err_msg)
-                self.done_signal.emit("ERROR", {})
+    return best_ckpt_path, best_test_metrics
 
 
-class OptunaTrainThread(QThread):
-    log_signal = pyqtSignal(str)
-    done_signal = pyqtSignal(str, dict)
-
-    def __init__(
-        self,
-        data_params: Dict[str, Any],
-        base_train_params: Dict[str, Any],
-        optuna_n_trials: int,
-        optuna_timeout: int,
-        use_test_metric_for_optuna: bool = False
-    ):
-        super().__init__()
-        self.data_params = data_params
-        self.base_train_params = base_train_params
-        self.optuna_n_trials = optuna_n_trials
-        self.optuna_timeout = optuna_timeout
-        self.use_test_metric_for_optuna = use_test_metric_for_optuna
-
-    def run(self):
+def train_worker(data_params, train_params, return_dict):
+    """
+    This function runs in a child process to do training.
+    We pass results back via return_dict from a multiprocessing.Manager() dict.
+    """
+    try:
+        original_bs = data_params["batch_size"]
         try:
-            seed_everything(42, workers=True)
-            study = optuna.create_study(direction="minimize")
-
-            def objective(trial: optuna.Trial) -> float:
-                trial_train_params = dict(self.base_train_params)
-                lr = trial.suggest_float("lr", 1e-6, 1e-1, log=True)
-                dropout = trial.suggest_float("dropout_rate", 0.0, 0.7)
-                optimizer_name = trial.suggest_categorical("optimizer_name", ["adam", "sgd", "adamw"])
-                scheduler_name = trial.suggest_categorical("scheduler_name", ["none", "steplr", "cosineannealing"])
-
-                trial_train_params["lr"] = lr
-                trial_train_params["dropout_rate"] = dropout
-                trial_train_params["optimizer_name"] = optimizer_name
-                trial_train_params["scheduler_name"] = scheduler_name
-
-                msg = (
-                    f"Trial {trial.number}: "
-                    f"lr={lr}, dropout={dropout}, opt={optimizer_name}, sch={scheduler_name}"
-                )
-                logger.info(msg)
-                self.log_signal.emit(msg + "\n")
-
-                best_ckpt_path, test_metrics, val_loss = run_training_once(
-                    DataConfig(**self.data_params),
-                    TrainConfig(**trial_train_params)
-                )
-                if not test_metrics:
-                    return 9999.0
-
-                if self.use_test_metric_for_optuna:
-                    test_loss = 9999.0
-                    if "test_results" in test_metrics:
-                        tr_ = test_metrics["test_results"]
-                        if len(tr_) > 0 and "test_loss" in tr_[0]:
-                            test_loss = tr_[0]["test_loss"]
-                    return test_loss
+            bcp, tmetrics = _try_run_training(data_params, train_params)
+            return_dict["status"] = "OK"
+            return_dict["ckpt_path"] = bcp
+            return_dict["test_metrics"] = tmetrics
+        except RuntimeError as re:
+            if "CUDA out of memory" in str(re):
+                print("[WARN] GPU OOM encountered. Attempting batch-size fallback.")
+                bcp2, tmetrics2 = _auto_adjust_batch_size(data_params, train_params, original_bs)
+                if bcp2 is None:
+                    return_dict["status"] = "ERROR"
+                    return_dict["ckpt_path"] = ""
+                    return_dict["test_metrics"] = {}
                 else:
-                    return val_loss if val_loss is not None else 9999.0
-
-            study.optimize(
-                objective,
-                n_trials=self.optuna_n_trials,
-                timeout=self.optuna_timeout if self.optuna_timeout > 0 else None
-            )
-
-            best_trial = study.best_trial
-            self.log_signal.emit(
-                f"Optuna best trial: {best_trial.number}, value={best_trial.value}\n"
-            )
-            self.log_signal.emit(f"Best params: {best_trial.params}\n")
-
-            # Re-train final model
-            best_params = dict(self.base_train_params)
-            best_params["lr"] = best_trial.params["lr"]
-            best_params["dropout_rate"] = best_trial.params["dropout_rate"]
-            best_params["optimizer_name"] = best_trial.params["optimizer_name"]
-            best_params["scheduler_name"] = best_trial.params["scheduler_name"]
-
-            self.log_signal.emit("Re-training final model with best hyperparams...\n")
-            best_ckpt_path, metrics_dict, _ = run_training_once(
-                DataConfig(**self.data_params),
-                TrainConfig(**best_params)
-            )
-            self.done_signal.emit(best_ckpt_path, metrics_dict)
-        except (ValueError, ImportError, RuntimeError) as e:
-            err_msg = f"ERROR during Optuna tuning: {e}\n{traceback.format_exc()}"
-            self.log_signal.emit(err_msg)
-            self.done_signal.emit("ERROR", {})
+                    return_dict["status"] = "OK"
+                    return_dict["ckpt_path"] = bcp2
+                    return_dict["test_metrics"] = tmetrics2
+            else:
+                print(f"[ERROR] Training crashed: {re}\n{traceback.format_exc()}")
+                return_dict["status"] = "ERROR"
+                return_dict["ckpt_path"] = ""
+                return_dict["test_metrics"] = {}
+    except Exception as e:
+        print(f"[ERROR] Training crashed: {e}\n{traceback.format_exc()}")
+        return_dict["status"] = "ERROR"
+        return_dict["ckpt_path"] = ""
+        return_dict["test_metrics"] = {}
 
 
-# =========================
-# 8) MAIN PLUGIN CLASS (GUI)
-# =========================
+def optuna_worker(data_params, base_train_params, optuna_n_trials, optuna_timeout, use_test_metric_for_optuna, return_dict):
+    """
+    This function runs in a child process for Optuna hyperparam tuning.
+    """
+    try:
+        seed_everything(42, workers=True)
+        # We'll define an objective that modifies a copy of base_train_params
+        def objective(trial: optuna.Trial) -> float:
+            trial_train_params = dict(base_train_params)
+            lr = trial.suggest_float("lr", 1e-6, 1e-1, log=True)
+            dropout = trial.suggest_float("dropout_rate", 0.0, 0.7)
+            optimizer_name = trial.suggest_categorical("optimizer_name", ["adam", "sgd", "adamw", "lamb", "lion"])
+            scheduler_name = trial.suggest_categorical("scheduler_name", ["none", "steplr", "cosineannealing"])
+
+            trial_train_params["lr"] = lr
+            trial_train_params["dropout_rate"] = dropout
+            trial_train_params["optimizer_name"] = optimizer_name
+            trial_train_params["scheduler_name"] = scheduler_name
+
+            print(f"[OPTUNA] Trial {trial.number}: lr={lr}, dropout={dropout}, "
+                  f"opt={optimizer_name}, sch={scheduler_name}")
+
+            # Attempt the run
+            try:
+                bcp, tmetrics = _try_run_training(data_params, trial_train_params)
+            except RuntimeError as re:
+                # If OOM, we can either fail or attempt fallback; for simplicity, fail the trial
+                if "CUDA out of memory" in str(re):
+                    print("[OPTUNA] OOM encountered. Setting trial value = 9999.")
+                    return 9999.0
+                else:
+                    raise
+
+            if not tmetrics:
+                return 9999.0
+
+            # We check val_loss or test_loss
+            if use_test_metric_for_optuna:
+                # check test_loss
+                if ("test_results" in tmetrics
+                    and len(tmetrics["test_results"]) > 0
+                    and "test_loss" in tmetrics["test_results"][0]):
+                    return float(tmetrics["test_results"][0]["test_loss"])
+                else:
+                    return 9999.0
+            else:
+                # We didn't store val_loss here, but run_training_once returns a val_loss
+                _, _, v_loss = run_training_once(DataConfig(**data_params), TrainConfig(**trial_train_params))
+                if v_loss is None:
+                    return 9999.0
+                return v_loss
+
+        study = optuna.create_study(direction="minimize")
+        study.optimize(
+            objective,
+            n_trials=optuna_n_trials,
+            timeout=optuna_timeout if optuna_timeout > 0 else None
+        )
+
+        best_trial = study.best_trial
+        print(f"[OPTUNA] Best trial: {best_trial.number}, value={best_trial.value}")
+        print(f"[OPTUNA] Params: {best_trial.params}")
+
+        # Re-train final model with best hyperparams
+        best_params = dict(base_train_params)
+        best_params["lr"] = best_trial.params["lr"]
+        best_params["dropout_rate"] = best_trial.params["dropout_rate"]
+        best_params["optimizer_name"] = best_trial.params["optimizer_name"]
+        best_params["scheduler_name"] = best_trial.params["scheduler_name"]
+
+        print("[OPTUNA] Re-training final model with best hyperparams...")
+        bcp, tmetrics = _try_run_training(data_params, best_params)
+
+        return_dict["status"] = "OK"
+        return_dict["ckpt_path"] = bcp
+        return_dict["test_metrics"] = tmetrics
+
+    except Exception as e:
+        print(f"[ERROR] Optuna tuning crashed: {e}\n{traceback.format_exc()}")
+        return_dict["status"] = "ERROR"
+        return_dict["ckpt_path"] = ""
+        return_dict["test_metrics"] = {}
+
+
+# ===============================
+# 9) MAIN PLUGIN CLASS (the GUI)
+# ===============================
 class Plugin(BasePlugin):
     def __init__(self):
         super().__init__()
         self.plugin_name = "Training"
 
-        def tr(text):
-            return text
-        self.tr = tr
-
         self.widget_main: Optional[QWidget] = None
-        self.text_log: Optional[QTextEdit] = None
         self.progress_bar: Optional[QProgressBar] = None
 
-        # Data / split inputs
+        # --- Data / split inputs
         self.train_data_dir_edit: Optional[QLineEdit] = None
         self.val_split_spin: Optional[QDoubleSpinBox] = None
         self.test_split_spin: Optional[QDoubleSpinBox] = None
         self.cb_allow_grayscale: Optional[QCheckBox] = None
 
+        # --- Architecture + Loss
         self.arch_combo: Optional[QComboBox] = None
         self.weighted_loss_cb: Optional[QCheckBox] = None
         self.cb_normalize_pixel_intensity: Optional[QCheckBox] = None
         self.cb_inception_299: Optional[QCheckBox] = None
         self.loss_combo: Optional[QComboBox] = None
 
+        # --- Basic Augs
         self.cb_bright_contrast: Optional[QCheckBox] = None
         self.cb_hue_sat: Optional[QCheckBox] = None
         self.cb_gauss_noise: Optional[QCheckBox] = None
@@ -1713,7 +1697,6 @@ class Plugin(BasePlugin):
         self.cb_elastic: Optional[QCheckBox] = None
         self.cb_grid_distortion: Optional[QCheckBox] = None
         self.cb_optical_distortion: Optional[QCheckBox] = None
-
         self.cb_mixup: Optional[QCheckBox] = None
         self.cb_cutmix: Optional[QCheckBox] = None
         self.mix_alpha_spin: Optional[QDoubleSpinBox] = None
@@ -1722,6 +1705,7 @@ class Plugin(BasePlugin):
         self.random_crop_scale_min_spin: Optional[QDoubleSpinBox] = None
         self.random_crop_scale_max_spin: Optional[QDoubleSpinBox] = None
 
+        # --- Hyperparams
         self.lr_spin: Optional[QDoubleSpinBox] = None
         self.momentum_spin: Optional[QDoubleSpinBox] = None
         self.wd_spin: Optional[QDoubleSpinBox] = None
@@ -1747,8 +1731,10 @@ class Plugin(BasePlugin):
         self.accum_batches_spin: Optional[QSpinBox] = None
         self.check_val_every_n_epoch: Optional[QSpinBox] = None
 
-        # The following checkboxes apply to both ResNet & ConvNeXt
-        # We'll just unify them in the code
+        # NEW: persistent workers
+        self.cb_persistent_workers: Optional[QCheckBox] = None
+
+        # --- Partial freeze
         self.cb_freeze_conv1_bn1: Optional[QCheckBox] = None
         self.cb_freeze_layer1: Optional[QCheckBox] = None
         self.cb_freeze_layer2: Optional[QCheckBox] = None
@@ -1770,11 +1756,12 @@ class Plugin(BasePlugin):
         self.cb_enable_tta: Optional[QCheckBox] = None
         self.cb_profile_memory: Optional[QCheckBox] = None
 
-        # Custom model
+        # --- Custom model
         self.cb_load_custom_model: Optional[QCheckBox] = None
         self.custom_model_path_edit: Optional[QLineEdit] = None
         self.custom_arch_file_edit: Optional[QLineEdit] = None
 
+        # --- Buttons
         self.btn_train: Optional[QPushButton] = None
         self.btn_export_results: Optional[QPushButton] = None
         self.btn_tune_optuna: Optional[QPushButton] = None
@@ -1782,28 +1769,98 @@ class Plugin(BasePlugin):
         self.optuna_trials_spin: Optional[QSpinBox] = None
         self.optuna_timeout_spin: Optional[QSpinBox] = None
 
-        self.train_thread: Optional[TrainThread] = None
-        self.optuna_thread: Optional[OptunaTrainThread] = None
+        # Advanced
+        self.cb_random_gamma: Optional[QCheckBox] = None
+        self.spin_gamma_low: Optional[QDoubleSpinBox] = None
+        self.spin_gamma_high: Optional[QDoubleSpinBox] = None
+        self.spin_gamma_prob: Optional[QDoubleSpinBox] = None
+
+        self.cb_clahe: Optional[QCheckBox] = None
+        self.spin_clahe_clip: Optional[QDoubleSpinBox] = None
+        self.spin_clahe_tile: Optional[QSpinBox] = None
+        self.spin_clahe_prob: Optional[QDoubleSpinBox] = None
+
+        self.cb_channel_shuffle: Optional[QCheckBox] = None
+        self.spin_channel_shuffle_prob: Optional[QDoubleSpinBox] = None
+
+        self.cb_posterize_solarize_equalize: Optional[QCheckBox] = None
+        self.spin_pse_prob: Optional[QDoubleSpinBox] = None
+        self.spin_posterize_bits: Optional[QSpinBox] = None
+        self.spin_solarize_threshold: Optional[QSpinBox] = None
+
+        self.cb_sharpen_denoise: Optional[QCheckBox] = None
+        self.spin_sharpen_prob: Optional[QDoubleSpinBox] = None
+        self.spin_sharpen_alpha_min: Optional[QDoubleSpinBox] = None
+        self.spin_sharpen_alpha_max: Optional[QDoubleSpinBox] = None
+        self.spin_sharpen_lightness_min: Optional[QDoubleSpinBox] = None
+        self.spin_sharpen_lightness_max: Optional[QDoubleSpinBox] = None
+
+        self.cb_gauss_vs_mult_noise: Optional[QCheckBox] = None
+        self.spin_gauss_mult_prob: Optional[QDoubleSpinBox] = None
+        self.spin_gauss_var_low: Optional[QDoubleSpinBox] = None
+        self.spin_gauss_var_high: Optional[QDoubleSpinBox] = None
+        self.spin_mult_lower: Optional[QDoubleSpinBox] = None
+        self.spin_mult_upper: Optional[QDoubleSpinBox] = None
+
+        self.cb_cutout_coarse_dropout: Optional[QCheckBox] = None
+        self.spin_cutout_max_holes: Optional[QSpinBox] = None
+        self.spin_cutout_max_height: Optional[QSpinBox] = None
+        self.spin_cutout_max_width: Optional[QSpinBox] = None
+        self.spin_cutout_prob: Optional[QDoubleSpinBox] = None
+
+        self.cb_shift_scale_rotate: Optional[QCheckBox] = None
+        self.spin_ssr_shift_limit: Optional[QDoubleSpinBox] = None
+        self.spin_ssr_scale_limit: Optional[QDoubleSpinBox] = None
+        self.spin_ssr_rotate_limit: Optional[QSpinBox] = None
+        self.spin_ssr_prob: Optional[QDoubleSpinBox] = None
+
+        self.cb_use_one_of_advanced_transforms: Optional[QCheckBox] = None
+        self.spin_one_of_adv_prob: Optional[QDoubleSpinBox] = None
+
+        # RandAugment
+        self.cb_randaugment: Optional[QCheckBox] = None
 
         self.best_ckpt_path: Optional[str] = None
         self.last_test_metrics: Optional[Dict[str, Any]] = None
 
+        # Multiprocessing variables
+        self.train_process: Optional[multiprocessing.Process] = None
+        self.train_result_manager = None
+        self.train_result_dict = None
+
+        self.optuna_process: Optional[multiprocessing.Process] = None
+        self.optuna_result_manager = None
+        self.optuna_result_dict = None
+
+        self.training_timer: Optional[QTimer] = None
+        self.optuna_timer: Optional[QTimer] = None
+
     def create_tab(self) -> QWidget:
         """
-        Build the entire UI layout for this plugin tab.
+        Build the entire GUI layout (scrollable) with all group boxes.
         """
         self.widget_main = QWidget()
-        layout = QVBoxLayout(self.widget_main)
+        main_layout = QVBoxLayout(self.widget_main)
 
-        # 1) DATA PATHS AND SPLITS
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        scroll_area.setWidget(container)
+        main_layout.addWidget(scroll_area)
+
+        # ========== DATA GROUP ==========
+        group_data = QGroupBox("Dataset & Splits")
+        data_layout = QVBoxLayout(group_data)
+
         h_data = QHBoxLayout()
         self.train_data_dir_edit = QLineEdit()
-        btn_browse_data = QPushButton(self.tr("Browse Data Folder..."))
+        btn_browse_data = QPushButton("Browse Data Folder...")
         btn_browse_data.clicked.connect(self.browse_dataset_folder)
-        h_data.addWidget(QLabel(self.tr("Dataset Folder:")))
+        h_data.addWidget(QLabel("Dataset Folder:"))
         h_data.addWidget(self.train_data_dir_edit)
         h_data.addWidget(btn_browse_data)
-        layout.addLayout(h_data)
+        data_layout.addLayout(h_data)
 
         h_splits = QHBoxLayout()
         self.val_split_spin = QDoubleSpinBox()
@@ -1813,270 +1870,510 @@ class Plugin(BasePlugin):
         self.test_split_spin.setRange(0, 100)
         self.test_split_spin.setValue(15.0)
 
-        h_splits.addWidget(QLabel(self.tr("Val Split (%)")))
+        h_splits.addWidget(QLabel("Val Split (%)"))
         h_splits.addWidget(self.val_split_spin)
-        h_splits.addWidget(QLabel(self.tr("Test Split (%)")))
+        h_splits.addWidget(QLabel("Test Split (%)"))
         h_splits.addWidget(self.test_split_spin)
-        layout.addLayout(h_splits)
+        data_layout.addLayout(h_splits)
 
-        self.cb_allow_grayscale = QCheckBox(self.tr("Allow Grayscale Images"))
-        layout.addWidget(self.cb_allow_grayscale)
+        self.cb_allow_grayscale = QCheckBox("Allow Grayscale Images")
+        data_layout.addWidget(self.cb_allow_grayscale)
 
-        # 2) ARCH + BASIC OPTIONS
+        container_layout.addWidget(group_data)
+
+        # ========== ARCH GROUP ==========
+        group_arch = QGroupBox("Architecture & Basic Options")
+        arch_layout = QVBoxLayout(group_arch)
+
         h_arch = QHBoxLayout()
         self.arch_combo = QComboBox()
         self.arch_combo.addItems([
             "resnet18", "resnet50", "resnet101",
             "densenet", "vgg", "inception", "mobilenet",
-            "efficientnet_b0", "convnext_tiny", "convnext_large"
+            "efficientnet_b0",
+            "convnext_tiny", "convnext_large", "convnext_base", "convnext_extralarge",
+            "convnext_v2",
+            "coatnet_0", "coatnet_1", "coatnet_2", "coatnet_3", "coatnet_4"
         ])
-        self.weighted_loss_cb = QCheckBox(self.tr("Weighted Loss"))
-        self.cb_normalize_pixel_intensity = QCheckBox(self.tr("Normalize Pixel"))
-        self.cb_inception_299 = QCheckBox(self.tr("Use 299 for Inception"))
+        self.weighted_loss_cb = QCheckBox("Weighted Loss")
+        self.cb_normalize_pixel_intensity = QCheckBox("Normalize Pixel")
+        self.cb_inception_299 = QCheckBox("Use 299 for Inception")
 
-        h_arch.addWidget(QLabel(self.tr("Architecture:")))
+        h_arch.addWidget(QLabel("Architecture:"))
         h_arch.addWidget(self.arch_combo)
         h_arch.addWidget(self.weighted_loss_cb)
         h_arch.addWidget(self.cb_normalize_pixel_intensity)
         h_arch.addWidget(self.cb_inception_299)
-        layout.addLayout(h_arch)
+        arch_layout.addLayout(h_arch)
 
-        # LOSS
+        h_loss = QHBoxLayout()
         self.loss_combo = QComboBox()
         self.loss_combo.addItems(["cross_entropy", "focal", "bce", "bce_single_logit"])
+        h_loss.addWidget(QLabel("Loss:"))
+        h_loss.addWidget(self.loss_combo)
+        arch_layout.addLayout(h_loss)
 
-        # 3) AUGMENTATIONS
-        group_aug = QHBoxLayout()
-        self.cb_bright_contrast = QCheckBox(self.tr("Brightness/Contrast"))
-        self.cb_hue_sat = QCheckBox(self.tr("Hue/Sat"))
-        self.cb_gauss_noise = QCheckBox(self.tr("GaussNoise"))
-        self.cb_rotation = QCheckBox(self.tr("Rotation"))
-        group_aug.addWidget(self.cb_bright_contrast)
-        group_aug.addWidget(self.cb_hue_sat)
-        group_aug.addWidget(self.cb_gauss_noise)
-        group_aug.addWidget(self.cb_rotation)
-        layout.addLayout(group_aug)
+        container_layout.addWidget(group_arch)
 
-        group_aug2 = QHBoxLayout()
-        self.cb_flip = QCheckBox(self.tr("Flipping"))
+        # ========== AUGS (BASIC) GROUP ==========
+        group_basic_augs = QGroupBox("Basic Augmentations")
+        basic_augs_layout = QVBoxLayout(group_basic_augs)
+
+        row1 = QHBoxLayout()
+        self.cb_bright_contrast = QCheckBox("Brightness/Contrast")
+        self.cb_hue_sat = QCheckBox("Hue/Sat")
+        self.cb_gauss_noise = QCheckBox("GaussNoise")
+        self.cb_rotation = QCheckBox("Rotation")
+        row1.addWidget(self.cb_bright_contrast)
+        row1.addWidget(self.cb_hue_sat)
+        row1.addWidget(self.cb_gauss_noise)
+        row1.addWidget(self.cb_rotation)
+        basic_augs_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        self.cb_flip = QCheckBox("Flipping")
         self.flip_mode_combo = QComboBox()
         self.flip_mode_combo.addItems(["horizontal", "vertical", "both"])
         self.flip_prob_spin = QDoubleSpinBox()
         self.flip_prob_spin.setRange(0.0, 1.0)
         self.flip_prob_spin.setValue(0.5)
-        self.cb_crop = QCheckBox(self.tr("Random Crop"))
-        self.cb_elastic = QCheckBox(self.tr("Elastic"))
+        self.cb_crop = QCheckBox("Random Crop")
+        self.cb_elastic = QCheckBox("Elastic")
+        row2.addWidget(self.cb_flip)
+        row2.addWidget(QLabel("Mode:"))
+        row2.addWidget(self.flip_mode_combo)
+        row2.addWidget(QLabel("Prob:"))
+        row2.addWidget(self.flip_prob_spin)
+        row2.addWidget(self.cb_crop)
+        row2.addWidget(self.cb_elastic)
+        basic_augs_layout.addLayout(row2)
 
-        group_aug2.addWidget(self.cb_flip)
-        group_aug2.addWidget(QLabel(self.tr("Mode:")))
-        group_aug2.addWidget(self.flip_mode_combo)
-        group_aug2.addWidget(QLabel(self.tr("Prob:")))
-        group_aug2.addWidget(self.flip_prob_spin)
-        group_aug2.addWidget(self.cb_crop)
-        group_aug2.addWidget(self.cb_elastic)
-        layout.addLayout(group_aug2)
-
-        group_aug3 = QHBoxLayout()
-        group_aug3.addWidget(QLabel(self.tr("Random Crop p:")))
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Random Crop p:"))
         self.random_crop_prob_spin = QDoubleSpinBox()
         self.random_crop_prob_spin.setRange(0.0, 1.0)
         self.random_crop_prob_spin.setValue(1.0)
-        group_aug3.addWidget(self.random_crop_prob_spin)
-        group_aug3.addWidget(QLabel(self.tr("Scale Min:")))
+        row3.addWidget(self.random_crop_prob_spin)
+        row3.addWidget(QLabel("Scale Min:"))
         self.random_crop_scale_min_spin = QDoubleSpinBox()
         self.random_crop_scale_min_spin.setRange(0.0, 1.0)
         self.random_crop_scale_min_spin.setValue(0.8)
-        group_aug3.addWidget(self.random_crop_scale_min_spin)
-        group_aug3.addWidget(QLabel(self.tr("Scale Max:")))
+        row3.addWidget(self.random_crop_scale_min_spin)
+        row3.addWidget(QLabel("Scale Max:"))
         self.random_crop_scale_max_spin = QDoubleSpinBox()
         self.random_crop_scale_max_spin.setRange(0.0, 1.0)
         self.random_crop_scale_max_spin.setValue(1.0)
-        group_aug3.addWidget(self.random_crop_scale_max_spin)
-        layout.addLayout(group_aug3)
+        row3.addWidget(self.random_crop_scale_max_spin)
+        basic_augs_layout.addLayout(row3)
 
-        group_aug4 = QHBoxLayout()
-        self.cb_grid_distortion = QCheckBox(self.tr("GridDistortion"))
-        self.cb_optical_distortion = QCheckBox(self.tr("OpticalDistortion"))
-        self.cb_mixup = QCheckBox(self.tr("MixUp"))
-        self.cb_cutmix = QCheckBox(self.tr("CutMix"))
+        row4 = QHBoxLayout()
+        self.cb_grid_distortion = QCheckBox("GridDistortion")
+        self.cb_optical_distortion = QCheckBox("OpticalDistortion")
+        self.cb_mixup = QCheckBox("MixUp")
+        self.cb_cutmix = QCheckBox("CutMix")
         self.mix_alpha_spin = QDoubleSpinBox()
         self.mix_alpha_spin.setRange(0.0, 5.0)
         self.mix_alpha_spin.setValue(1.0)
-        group_aug4.addWidget(self.cb_grid_distortion)
-        group_aug4.addWidget(self.cb_optical_distortion)
-        group_aug4.addWidget(self.cb_mixup)
-        group_aug4.addWidget(self.cb_cutmix)
-        group_aug4.addWidget(QLabel(self.tr("alpha:")))
-        group_aug4.addWidget(self.mix_alpha_spin)
-        layout.addLayout(group_aug4)
+        row4.addWidget(self.cb_grid_distortion)
+        row4.addWidget(self.cb_optical_distortion)
+        row4.addWidget(self.cb_mixup)
+        row4.addWidget(self.cb_cutmix)
+        row4.addWidget(QLabel("alpha:"))
+        row4.addWidget(self.mix_alpha_spin)
+        basic_augs_layout.addLayout(row4)
 
-        # 4) HYPERPARAMS
-        h_params = QHBoxLayout()
+        container_layout.addWidget(group_basic_augs)
+
+        # ========== AUGS (ADVANCED) GROUP ==========
+        group_adv_augs = QGroupBox("Advanced Augmentations")
+        adv_layout = QVBoxLayout(group_adv_augs)
+
+        # RandomGamma
+        rand_gamma_layout = QHBoxLayout()
+        self.cb_random_gamma = QCheckBox("RandomGamma")
+        self.spin_gamma_low = QDoubleSpinBox()
+        self.spin_gamma_low.setRange(1.0, 300.0)
+        self.spin_gamma_low.setValue(80.0)
+        self.spin_gamma_high = QDoubleSpinBox()
+        self.spin_gamma_high.setRange(1.0, 300.0)
+        self.spin_gamma_high.setValue(120.0)
+        self.spin_gamma_prob = QDoubleSpinBox()
+        self.spin_gamma_prob.setRange(0.0, 1.0)
+        self.spin_gamma_prob.setValue(0.5)
+
+        rand_gamma_layout.addWidget(self.cb_random_gamma)
+        rand_gamma_layout.addWidget(QLabel("GammaLow:"))
+        rand_gamma_layout.addWidget(self.spin_gamma_low)
+        rand_gamma_layout.addWidget(QLabel("GammaHigh:"))
+        rand_gamma_layout.addWidget(self.spin_gamma_high)
+        rand_gamma_layout.addWidget(QLabel("Prob:"))
+        rand_gamma_layout.addWidget(self.spin_gamma_prob)
+        adv_layout.addLayout(rand_gamma_layout)
+
+        # CLAHE
+        clahe_layout = QHBoxLayout()
+        self.cb_clahe = QCheckBox("CLAHE")
+        self.spin_clahe_clip = QDoubleSpinBox()
+        self.spin_clahe_clip.setRange(1.0, 50.0)
+        self.spin_clahe_clip.setValue(4.0)
+        self.spin_clahe_tile = QSpinBox()
+        self.spin_clahe_tile.setRange(1, 64)
+        self.spin_clahe_tile.setValue(8)
+        self.spin_clahe_prob = QDoubleSpinBox()
+        self.spin_clahe_prob.setRange(0.0, 1.0)
+        self.spin_clahe_prob.setValue(0.3)
+        clahe_layout.addWidget(self.cb_clahe)
+        clahe_layout.addWidget(QLabel("ClipLimit:"))
+        clahe_layout.addWidget(self.spin_clahe_clip)
+        clahe_layout.addWidget(QLabel("TileSize:"))
+        clahe_layout.addWidget(self.spin_clahe_tile)
+        clahe_layout.addWidget(QLabel("Prob:"))
+        clahe_layout.addWidget(self.spin_clahe_prob)
+        adv_layout.addLayout(clahe_layout)
+
+        # ChannelShuffle
+        cshuffle_layout = QHBoxLayout()
+        self.cb_channel_shuffle = QCheckBox("ChannelShuffle")
+        self.spin_channel_shuffle_prob = QDoubleSpinBox()
+        self.spin_channel_shuffle_prob.setRange(0.0, 1.0)
+        self.spin_channel_shuffle_prob.setValue(0.2)
+        cshuffle_layout.addWidget(self.cb_channel_shuffle)
+        cshuffle_layout.addWidget(QLabel("Prob:"))
+        cshuffle_layout.addWidget(self.spin_channel_shuffle_prob)
+        adv_layout.addLayout(cshuffle_layout)
+
+        # Posterize/Solarize/Equalize
+        pse_layout = QHBoxLayout()
+        self.cb_posterize_solarize_equalize = QCheckBox("Posterize/Solarize/Equalize")
+        self.spin_pse_prob = QDoubleSpinBox()
+        self.spin_pse_prob.setRange(0.0, 1.0)
+        self.spin_pse_prob.setValue(0.2)
+        self.spin_posterize_bits = QSpinBox()
+        self.spin_posterize_bits.setRange(1, 8)
+        self.spin_posterize_bits.setValue(4)
+        self.spin_solarize_threshold = QSpinBox()
+        self.spin_solarize_threshold.setRange(0, 255)
+        self.spin_solarize_threshold.setValue(128)
+        pse_layout.addWidget(self.cb_posterize_solarize_equalize)
+        pse_layout.addWidget(QLabel("Prob:"))
+        pse_layout.addWidget(self.spin_pse_prob)
+        pse_layout.addWidget(QLabel("PosterizeBits:"))
+        pse_layout.addWidget(self.spin_posterize_bits)
+        pse_layout.addWidget(QLabel("SolarizeThr:"))
+        pse_layout.addWidget(self.spin_solarize_threshold)
+        adv_layout.addLayout(pse_layout)
+
+        # Sharpen
+        sharpen_layout = QHBoxLayout()
+        self.cb_sharpen_denoise = QCheckBox("Sharpen")
+        self.spin_sharpen_prob = QDoubleSpinBox()
+        self.spin_sharpen_prob.setRange(0.0, 1.0)
+        self.spin_sharpen_prob.setValue(0.3)
+        self.spin_sharpen_alpha_min = QDoubleSpinBox()
+        self.spin_sharpen_alpha_min.setRange(0.0, 1.0)
+        self.spin_sharpen_alpha_min.setValue(0.2)
+        self.spin_sharpen_alpha_max = QDoubleSpinBox()
+        self.spin_sharpen_alpha_max.setRange(0.0, 1.0)
+        self.spin_sharpen_alpha_max.setValue(0.5)
+        self.spin_sharpen_lightness_min = QDoubleSpinBox()
+        self.spin_sharpen_lightness_min.setRange(0.0, 3.0)
+        self.spin_sharpen_lightness_min.setValue(0.5)
+        self.spin_sharpen_lightness_max = QDoubleSpinBox()
+        self.spin_sharpen_lightness_max.setRange(0.0, 3.0)
+        self.spin_sharpen_lightness_max.setValue(1.0)
+
+        sharpen_layout.addWidget(self.cb_sharpen_denoise)
+        sharpen_layout.addWidget(QLabel("Prob:"))
+        sharpen_layout.addWidget(self.spin_sharpen_prob)
+        sharpen_layout.addWidget(QLabel("AlphaMin:"))
+        sharpen_layout.addWidget(self.spin_sharpen_alpha_min)
+        sharpen_layout.addWidget(QLabel("AlphaMax:"))
+        sharpen_layout.addWidget(self.spin_sharpen_alpha_max)
+        sharpen_layout.addWidget(QLabel("LightMin:"))
+        sharpen_layout.addWidget(self.spin_sharpen_lightness_min)
+        sharpen_layout.addWidget(QLabel("LightMax:"))
+        sharpen_layout.addWidget(self.spin_sharpen_lightness_max)
+        adv_layout.addLayout(sharpen_layout)
+
+        # Gauss vs Mult Noise
+        gm_layout = QHBoxLayout()
+        self.cb_gauss_vs_mult_noise = QCheckBox("Gauss vs Mult Noise")
+        self.spin_gauss_mult_prob = QDoubleSpinBox()
+        self.spin_gauss_mult_prob.setRange(0.0, 1.0)
+        self.spin_gauss_mult_prob.setValue(0.3)
+        self.spin_gauss_var_low = QDoubleSpinBox()
+        self.spin_gauss_var_low.setRange(0.0, 1000.0)
+        self.spin_gauss_var_low.setValue(10.0)
+        self.spin_gauss_var_high = QDoubleSpinBox()
+        self.spin_gauss_var_high.setRange(0.0, 1000.0)
+        self.spin_gauss_var_high.setValue(50.0)
+        self.spin_mult_lower = QDoubleSpinBox()
+        self.spin_mult_lower.setRange(0.0, 10.0)
+        self.spin_mult_lower.setValue(0.9)
+        self.spin_mult_upper = QDoubleSpinBox()
+        self.spin_mult_upper.setRange(0.0, 10.0)
+        self.spin_mult_upper.setValue(1.1)
+        gm_layout.addWidget(self.cb_gauss_vs_mult_noise)
+        gm_layout.addWidget(QLabel("Prob:"))
+        gm_layout.addWidget(self.spin_gauss_mult_prob)
+        gm_layout.addWidget(QLabel("GaussVarLow:"))
+        gm_layout.addWidget(self.spin_gauss_var_low)
+        gm_layout.addWidget(QLabel("GaussVarHigh:"))
+        gm_layout.addWidget(self.spin_gauss_var_high)
+        gm_layout.addWidget(QLabel("MultLower:"))
+        gm_layout.addWidget(self.spin_mult_lower)
+        gm_layout.addWidget(QLabel("MultUpper:"))
+        gm_layout.addWidget(self.spin_mult_upper)
+        adv_layout.addLayout(gm_layout)
+
+        # Cutout
+        cutout_layout = QHBoxLayout()
+        self.cb_cutout_coarse_dropout = QCheckBox("Cutout/CoarseDropout")
+        self.spin_cutout_max_holes = QSpinBox()
+        self.spin_cutout_max_holes.setRange(1, 100)
+        self.spin_cutout_max_holes.setValue(8)
+        self.spin_cutout_max_height = QSpinBox()
+        self.spin_cutout_max_height.setRange(1, 512)
+        self.spin_cutout_max_height.setValue(32)
+        self.spin_cutout_max_width = QSpinBox()
+        self.spin_cutout_max_width.setRange(1, 512)
+        self.spin_cutout_max_width.setValue(32)
+        self.spin_cutout_prob = QDoubleSpinBox()
+        self.spin_cutout_prob.setRange(0.0, 1.0)
+        self.spin_cutout_prob.setValue(0.5)
+        cutout_layout.addWidget(self.cb_cutout_coarse_dropout)
+        cutout_layout.addWidget(QLabel("MaxHoles:"))
+        cutout_layout.addWidget(self.spin_cutout_max_holes)
+        cutout_layout.addWidget(QLabel("MaxH:"))
+        cutout_layout.addWidget(self.spin_cutout_max_height)
+        cutout_layout.addWidget(QLabel("MaxW:"))
+        cutout_layout.addWidget(self.spin_cutout_max_width)
+        cutout_layout.addWidget(QLabel("Prob:"))
+        cutout_layout.addWidget(self.spin_cutout_prob)
+        adv_layout.addLayout(cutout_layout)
+
+        # ShiftScaleRotate
+        ssr_layout = QHBoxLayout()
+        self.cb_shift_scale_rotate = QCheckBox("ShiftScaleRotate")
+        self.spin_ssr_shift_limit = QDoubleSpinBox()
+        self.spin_ssr_shift_limit.setRange(0.0, 1.0)
+        self.spin_ssr_shift_limit.setValue(0.1)
+        self.spin_ssr_scale_limit = QDoubleSpinBox()
+        self.spin_ssr_scale_limit.setRange(0.0, 1.0)
+        self.spin_ssr_scale_limit.setValue(0.1)
+        self.spin_ssr_rotate_limit = QSpinBox()
+        self.spin_ssr_rotate_limit.setRange(0, 180)
+        self.spin_ssr_rotate_limit.setValue(15)
+        self.spin_ssr_prob = QDoubleSpinBox()
+        self.spin_ssr_prob.setRange(0.0, 1.0)
+        self.spin_ssr_prob.setValue(0.4)
+        ssr_layout.addWidget(self.cb_shift_scale_rotate)
+        ssr_layout.addWidget(QLabel("ShiftLimit:"))
+        ssr_layout.addWidget(self.spin_ssr_shift_limit)
+        ssr_layout.addWidget(QLabel("ScaleLimit:"))
+        ssr_layout.addWidget(self.spin_ssr_scale_limit)
+        ssr_layout.addWidget(QLabel("RotateLimit:"))
+        ssr_layout.addWidget(self.spin_ssr_rotate_limit)
+        ssr_layout.addWidget(QLabel("Prob:"))
+        ssr_layout.addWidget(self.spin_ssr_prob)
+        adv_layout.addLayout(ssr_layout)
+
+        # OneOf advanced transforms
+        oneof_layout = QHBoxLayout()
+        self.cb_use_one_of_advanced_transforms = QCheckBox("Use OneOf Advanced Transforms?")
+        self.spin_one_of_adv_prob = QDoubleSpinBox()
+        self.spin_one_of_adv_prob.setRange(0.0, 1.0)
+        self.spin_one_of_adv_prob.setValue(0.5)
+        oneof_layout.addWidget(self.cb_use_one_of_advanced_transforms)
+        oneof_layout.addWidget(QLabel("OneOf Prob:"))
+        oneof_layout.addWidget(self.spin_one_of_adv_prob)
+        adv_layout.addLayout(oneof_layout)
+
+        # RandAugment for CoAtNet
+        self.cb_randaugment = QCheckBox("RandAugment (CoAtNet only)")
+        adv_layout.addWidget(self.cb_randaugment)
+
+        container_layout.addWidget(group_adv_augs)
+
+        # ========== HYPERPARAMS GROUP ==========
+        group_hparams = QGroupBox("Hyperparameters & Training")
+        hp_layout = QVBoxLayout(group_hparams)
+
+        row_hp1 = QHBoxLayout()
         self.lr_spin = QDoubleSpinBox()
         self.lr_spin.setRange(1e-7, 1.0)
         self.lr_spin.setDecimals(7)
         self.lr_spin.setValue(1e-4)
-        self.lr_spin.setToolTip("Learning rate")
         self.momentum_spin = QDoubleSpinBox()
         self.momentum_spin.setRange(0.0, 1.0)
         self.momentum_spin.setValue(0.9)
         self.wd_spin = QDoubleSpinBox()
-        self.wd_spin.setRange(0, 1.0)
+        self.wd_spin.setRange(0.0, 1.0)
         self.wd_spin.setDecimals(6)
         self.wd_spin.setValue(1e-4)
         self.optimizer_combo = QComboBox()
-        self.optimizer_combo.addItems(["adam", "sgd", "adamw", "lamb"])
+        self.optimizer_combo.addItems(["adam", "sgd", "adamw", "lamb", "lion"])
         self.scheduler_combo = QComboBox()
-        self.scheduler_combo.addItems(["none", "steplr", "reducelronplateau", "cosineannealing", "cycliclr"])
+        self.scheduler_combo.addItems(["none", "steplr", "reducelronplateau",
+                                       "cosineannealing", "cycliclr"])
         self.epochs_spin = QSpinBox()
         self.epochs_spin.setRange(1, 2000)
         self.epochs_spin.setValue(5)
         self.batch_spin = QSpinBox()
         self.batch_spin.setRange(1, 512)
         self.batch_spin.setValue(8)
-        self.cb_early_stopping = QCheckBox(self.tr("Early Stopping"))
+        self.cb_early_stopping = QCheckBox("Early Stopping")
 
-        h_params.addWidget(QLabel(self.tr("LR:")))
-        h_params.addWidget(self.lr_spin)
-        h_params.addWidget(QLabel(self.tr("Momentum:")))
-        h_params.addWidget(self.momentum_spin)
-        h_params.addWidget(QLabel(self.tr("WD:")))
-        h_params.addWidget(self.wd_spin)
-        h_params.addWidget(QLabel(self.tr("Opt:")))
-        h_params.addWidget(self.optimizer_combo)
-        h_params.addWidget(QLabel(self.tr("Sched:")))
-        h_params.addWidget(self.scheduler_combo)
-        h_params.addWidget(QLabel(self.tr("Epochs:")))
-        h_params.addWidget(self.epochs_spin)
-        h_params.addWidget(QLabel(self.tr("Batch:")))
-        h_params.addWidget(self.batch_spin)
-        h_params.addWidget(self.cb_early_stopping)
-        layout.addLayout(h_params)
+        row_hp1.addWidget(QLabel("LR:"))
+        row_hp1.addWidget(self.lr_spin)
+        row_hp1.addWidget(QLabel("Momentum:"))
+        row_hp1.addWidget(self.momentum_spin)
+        row_hp1.addWidget(QLabel("WD:"))
+        row_hp1.addWidget(self.wd_spin)
+        row_hp1.addWidget(QLabel("Opt:"))
+        row_hp1.addWidget(self.optimizer_combo)
+        row_hp1.addWidget(QLabel("Sched:"))
+        row_hp1.addWidget(self.scheduler_combo)
+        row_hp1.addWidget(QLabel("Epochs:"))
+        row_hp1.addWidget(self.epochs_spin)
+        row_hp1.addWidget(QLabel("Batch:"))
+        row_hp1.addWidget(self.batch_spin)
+        row_hp1.addWidget(self.cb_early_stopping)
+        hp_layout.addLayout(row_hp1)
 
-        # Scheduler params
         self.scheduler_params_edit = QLineEdit("step_size=10,gamma=0.1")
-        self.scheduler_params_edit.setToolTip("Scheduler parameters (key=val, comma-separated).")
-        layout.addWidget(QLabel(self.tr("Scheduler Params:")))
-        layout.addWidget(self.scheduler_params_edit)
+        hp_layout.addWidget(QLabel("Scheduler Params (comma key=val):"))
+        hp_layout.addWidget(self.scheduler_params_edit)
 
-        h_reg = QHBoxLayout()
+        row_hp2 = QHBoxLayout()
         self.dropout_spin = QDoubleSpinBox()
         self.dropout_spin.setRange(0.0, 1.0)
         self.dropout_spin.setValue(0.0)
         self.label_smoothing_spin = QDoubleSpinBox()
         self.label_smoothing_spin.setRange(0.0, 0.9)
         self.label_smoothing_spin.setValue(0.0)
-        self.cb_freeze_backbone = QCheckBox(self.tr("Freeze Entire Backbone"))
+        self.cb_freeze_backbone = QCheckBox("Freeze Entire Backbone")
         self.clip_val_spin = QDoubleSpinBox()
         self.clip_val_spin.setRange(0.0, 10.0)
         self.clip_val_spin.setValue(0.0)
 
-        h_reg.addWidget(QLabel(self.tr("Dropout:")))
-        h_reg.addWidget(self.dropout_spin)
-        h_reg.addWidget(QLabel(self.tr("LabelSmooth:")))
-        h_reg.addWidget(self.label_smoothing_spin)
-        h_reg.addWidget(self.cb_freeze_backbone)
-        h_reg.addWidget(QLabel(self.tr("Loss:")))
-        h_reg.addWidget(self.loss_combo)
-        h_reg.addWidget(QLabel(self.tr("ClipVal:")))
-        h_reg.addWidget(self.clip_val_spin)
-        layout.addLayout(h_reg)
+        row_hp2.addWidget(QLabel("Dropout:"))
+        row_hp2.addWidget(self.dropout_spin)
+        row_hp2.addWidget(QLabel("LabelSmooth:"))
+        row_hp2.addWidget(self.label_smoothing_spin)
+        row_hp2.addWidget(self.cb_freeze_backbone)
+        row_hp2.addWidget(QLabel("ClipVal:"))
+        row_hp2.addWidget(self.clip_val_spin)
+        hp_layout.addLayout(row_hp2)
 
-        # 5) ADVANCED
-        h_monitor = QHBoxLayout()
-        self.cb_lr_finder = QCheckBox(self.tr("LR Finder"))
-        self.cb_accept_lr_suggestion = QCheckBox(self.tr("Accept LR Suggestion?"))
-        self.cb_tensorboard = QCheckBox(self.tr("TensorBoard Logger"))
-        self.cb_mixed_precision = QCheckBox(self.tr("Mixed Precision"))
+        row_hp3 = QHBoxLayout()
+        self.cb_lr_finder = QCheckBox("LR Finder")
+        self.cb_accept_lr_suggestion = QCheckBox("Accept LR Suggestion?")
+        self.cb_tensorboard = QCheckBox("TensorBoard Logger")
+        self.cb_mixed_precision = QCheckBox("Mixed Precision")
         self.warmup_epochs_spin = QSpinBox()
         self.warmup_epochs_spin.setRange(0, 100)
         self.warmup_epochs_spin.setValue(0)
 
-        h_monitor.addWidget(self.cb_lr_finder)
-        h_monitor.addWidget(self.cb_accept_lr_suggestion)
-        h_monitor.addWidget(self.cb_tensorboard)
-        h_monitor.addWidget(self.cb_mixed_precision)
-        h_monitor.addWidget(QLabel(self.tr("Warmup:")))
-        h_monitor.addWidget(self.warmup_epochs_spin)
-        layout.addLayout(h_monitor)
+        row_hp3.addWidget(self.cb_lr_finder)
+        row_hp3.addWidget(self.cb_accept_lr_suggestion)
+        row_hp3.addWidget(self.cb_tensorboard)
+        row_hp3.addWidget(self.cb_mixed_precision)
+        row_hp3.addWidget(QLabel("Warmup:"))
+        row_hp3.addWidget(self.warmup_epochs_spin)
+        hp_layout.addLayout(row_hp3)
 
-        h_new1 = QHBoxLayout()
+        row_hp4 = QHBoxLayout()
         self.num_workers_spin = QSpinBox()
         self.num_workers_spin.setRange(0, 32)
         self.num_workers_spin.setValue(8)
-        self.cb_grad_checkpoint = QCheckBox(self.tr("Gradient Checkpointing"))
-        self.cb_grad_accum = QCheckBox(self.tr("Gradient Accumulation"))
+        self.cb_grad_checkpoint = QCheckBox("Gradient Checkpointing")
+        self.cb_grad_accum = QCheckBox("Grad Accumulation")
         self.accum_batches_spin = QSpinBox()
         self.accum_batches_spin.setRange(1, 64)
         self.accum_batches_spin.setValue(2)
         self.accum_batches_spin.setEnabled(False)
 
+        # NEW: persistent workers
+        self.cb_persistent_workers = QCheckBox("Persistent Dataloader Workers")
+
         def toggle_accum_spin():
             self.accum_batches_spin.setEnabled(self.cb_grad_accum.isChecked())
         self.cb_grad_accum.stateChanged.connect(toggle_accum_spin)
 
-        h_new1.addWidget(QLabel(self.tr("Workers:")))
-        h_new1.addWidget(self.num_workers_spin)
-        h_new1.addWidget(self.cb_grad_checkpoint)
-        h_new1.addWidget(self.cb_grad_accum)
-        h_new1.addWidget(QLabel(self.tr("Accumulate Batches:")))
-        h_new1.addWidget(self.accum_batches_spin)
-        layout.addLayout(h_new1)
+        row_hp4.addWidget(QLabel("Workers:"))
+        row_hp4.addWidget(self.num_workers_spin)
+        row_hp4.addWidget(self.cb_grad_checkpoint)
+        row_hp4.addWidget(self.cb_grad_accum)
+        row_hp4.addWidget(QLabel("Accumulate Batches:"))
+        row_hp4.addWidget(self.accum_batches_spin)
 
-        h_new2 = QHBoxLayout()
+        # Add the new persistent workers checkbox
+        row_hp4.addWidget(self.cb_persistent_workers)
+
+        hp_layout.addLayout(row_hp4)
+
+        row_hp5 = QHBoxLayout()
         self.check_val_every_n_epoch = QSpinBox()
         self.check_val_every_n_epoch.setRange(1, 50)
         self.check_val_every_n_epoch.setValue(1)
 
-        h_new2.addWidget(QLabel(self.tr("Val every N epoch:")))
-        h_new2.addWidget(self.check_val_every_n_epoch)
-
-        self.btn_train = QPushButton(self.tr("Start Training"))
+        self.btn_train = QPushButton("Start Training")
         self.btn_train.clicked.connect(self.start_training)
-        h_new2.addWidget(self.btn_train)
-        layout.addLayout(h_new2)
+        row_hp5.addWidget(QLabel("Val every N epoch:"))
+        row_hp5.addWidget(self.check_val_every_n_epoch)
+        row_hp5.addWidget(self.btn_train)
+        hp_layout.addLayout(row_hp5)
 
-        # 6) PARTIAL FREEZE CONTROLS (For ResNet & ConvNeXt)
-        group_resnet_freeze = QHBoxLayout()
-        group_resnet_freeze.addWidget(QLabel(self.tr("ResNet / ConvNeXt Freeze:")))
-        self.cb_freeze_conv1_bn1 = QCheckBox(self.tr("conv1+bn1"))
-        self.cb_freeze_layer1 = QCheckBox(self.tr("layer1"))
-        self.cb_freeze_layer2 = QCheckBox(self.tr("layer2"))
-        self.cb_freeze_layer3 = QCheckBox(self.tr("layer3"))
-        self.cb_freeze_layer4 = QCheckBox(self.tr("layer4"))
-        self.cb_freeze_convnext_block0 = QCheckBox(self.tr("block0"))
-        self.cb_freeze_convnext_block1 = QCheckBox(self.tr("block1"))
-        self.cb_freeze_convnext_block2 = QCheckBox(self.tr("block2"))
-        self.cb_freeze_convnext_block3 = QCheckBox(self.tr("block3"))
+        container_layout.addWidget(group_hparams)
 
-        group_resnet_freeze.addWidget(self.cb_freeze_conv1_bn1)
-        group_resnet_freeze.addWidget(self.cb_freeze_layer1)
-        group_resnet_freeze.addWidget(self.cb_freeze_layer2)
-        group_resnet_freeze.addWidget(self.cb_freeze_layer3)
-        group_resnet_freeze.addWidget(self.cb_freeze_layer4)
-        group_resnet_freeze.addWidget(self.cb_freeze_convnext_block0)
-        group_resnet_freeze.addWidget(self.cb_freeze_convnext_block1)
-        group_resnet_freeze.addWidget(self.cb_freeze_convnext_block2)
-        group_resnet_freeze.addWidget(self.cb_freeze_convnext_block3)
-        layout.addLayout(group_resnet_freeze)
+        # ========== PARTIAL FREEZE GROUP ==========
+        group_freeze = QGroupBox("Partial Freeze Options")
+        freeze_layout = QVBoxLayout(group_freeze)
 
-        self.cb_val_center_crop = QCheckBox(self.tr("Center Crop for Validation/Test"))
-        layout.addWidget(self.cb_val_center_crop)
+        row_freeze1 = QHBoxLayout()
+        row_freeze1.addWidget(QLabel("ResNet/ConvNeXt Freeze:"))
+        self.cb_freeze_conv1_bn1 = QCheckBox("conv1+bn1")
+        self.cb_freeze_layer1 = QCheckBox("layer1")
+        self.cb_freeze_layer2 = QCheckBox("layer2")
+        self.cb_freeze_layer3 = QCheckBox("layer3")
+        self.cb_freeze_layer4 = QCheckBox("layer4")
+        self.cb_freeze_convnext_block0 = QCheckBox("block0")
+        self.cb_freeze_convnext_block1 = QCheckBox("block1")
+        self.cb_freeze_convnext_block2 = QCheckBox("block2")
+        self.cb_freeze_convnext_block3 = QCheckBox("block3")
 
-        # 7) EARLY STOPPING
-        es_layout = QHBoxLayout()
-        es_layout.addWidget(QLabel(self.tr("ES Monitor:")))
+        row_freeze1.addWidget(self.cb_freeze_conv1_bn1)
+        row_freeze1.addWidget(self.cb_freeze_layer1)
+        row_freeze1.addWidget(self.cb_freeze_layer2)
+        row_freeze1.addWidget(self.cb_freeze_layer3)
+        row_freeze1.addWidget(self.cb_freeze_layer4)
+        row_freeze1.addWidget(self.cb_freeze_convnext_block0)
+        row_freeze1.addWidget(self.cb_freeze_convnext_block1)
+        row_freeze1.addWidget(self.cb_freeze_convnext_block2)
+        row_freeze1.addWidget(self.cb_freeze_convnext_block3)
+        freeze_layout.addLayout(row_freeze1)
+
+        self.cb_val_center_crop = QCheckBox("Center Crop for Validation/Test")
+        freeze_layout.addWidget(self.cb_val_center_crop)
+        container_layout.addWidget(group_freeze)
+
+        # ========== EARLY STOPPING GROUP ==========
+        group_es = QGroupBox("Early Stopping Settings")
+        es_layout = QHBoxLayout(group_es)
+
+        es_layout.addWidget(QLabel("ES Monitor:"))
         self.es_monitor_combo = QComboBox()
         self.es_monitor_combo.addItems(["val_loss", "val_acc"])
         es_layout.addWidget(self.es_monitor_combo)
 
-        es_layout.addWidget(QLabel(self.tr("Patience:")))
+        es_layout.addWidget(QLabel("Patience:"))
         self.es_patience_spin = QSpinBox()
         self.es_patience_spin.setRange(1, 20)
         self.es_patience_spin.setValue(5)
         es_layout.addWidget(self.es_patience_spin)
 
-        es_layout.addWidget(QLabel(self.tr("Min Delta:")))
+        es_layout.addWidget(QLabel("MinDelta:"))
         self.es_min_delta_spin = QDoubleSpinBox()
         self.es_min_delta_spin.setRange(0.0, 1.0)
         self.es_min_delta_spin.setDecimals(4)
@@ -2084,19 +2381,22 @@ class Plugin(BasePlugin):
         self.es_min_delta_spin.setValue(0.0)
         es_layout.addWidget(self.es_min_delta_spin)
 
-        es_layout.addWidget(QLabel(self.tr("Mode:")))
+        es_layout.addWidget(QLabel("Mode:"))
         self.es_mode_combo = QComboBox()
         self.es_mode_combo.addItems(["min", "max"])
         es_layout.addWidget(self.es_mode_combo)
-        layout.addLayout(es_layout)
 
-        # 8) OPTUNA
-        self.cb_optuna_use_test_metric = QCheckBox(self.tr("Use Test Loss as Optuna Objective?"))
-        self.cb_optuna_use_test_metric.setChecked(False)
-        layout.addWidget(self.cb_optuna_use_test_metric)
+        container_layout.addWidget(group_es)
 
-        h_optuna = QHBoxLayout()
-        self.btn_tune_optuna = QPushButton(self.tr("Tune with Optuna"))
+        # ========== OPTUNA GROUP ==========
+        group_optuna = QGroupBox("Optuna Hyperparam Tuning")
+        optuna_layout = QVBoxLayout(group_optuna)
+
+        self.cb_optuna_use_test_metric = QCheckBox("Use Test Loss as Optuna Objective?")
+        optuna_layout.addWidget(self.cb_optuna_use_test_metric)
+
+        row_optuna = QHBoxLayout()
+        self.btn_tune_optuna = QPushButton("Tune with Optuna")
         self.btn_tune_optuna.clicked.connect(self.start_optuna_tuning)
         self.optuna_trials_spin = QSpinBox()
         self.optuna_trials_spin.setRange(1, 100)
@@ -2104,98 +2404,104 @@ class Plugin(BasePlugin):
         self.optuna_timeout_spin = QSpinBox()
         self.optuna_timeout_spin.setRange(0, 100000)
         self.optuna_timeout_spin.setValue(0)
-        h_optuna.addWidget(self.btn_tune_optuna)
-        h_optuna.addWidget(QLabel(self.tr("Trials:")))
-        h_optuna.addWidget(self.optuna_trials_spin)
-        h_optuna.addWidget(QLabel(self.tr("Timeout (sec):")))
-        h_optuna.addWidget(self.optuna_timeout_spin)
-        layout.addLayout(h_optuna)
+        row_optuna.addWidget(self.btn_tune_optuna)
+        row_optuna.addWidget(QLabel("Trials:"))
+        row_optuna.addWidget(self.optuna_trials_spin)
+        row_optuna.addWidget(QLabel("Timeout (sec):"))
+        row_optuna.addWidget(self.optuna_timeout_spin)
+        optuna_layout.addLayout(row_optuna)
 
-        # 9) EXTRA OPTIONS
-        extra_layout = QHBoxLayout()
-        self.cb_pretrained_weights = QCheckBox(self.tr("Use Pretrained Weights"))
+        container_layout.addWidget(group_optuna)
+
+        # ========== EXTRA OPTIONS GROUP ==========
+        group_extra = QGroupBox("Extra Options")
+        extra_layout = QHBoxLayout(group_extra)
+        self.cb_pretrained_weights = QCheckBox("Use Pretrained Weights")
         self.cb_pretrained_weights.setChecked(True)
-        self.cb_run_gc = QCheckBox(self.tr("Run GC Each Epoch"))
-        self.cb_enable_tta = QCheckBox(self.tr("Enable TTA"))
-        self.cb_profile_memory = QCheckBox(self.tr("Profile Memory"))
+        self.cb_run_gc = QCheckBox("Run GC Each Epoch")
+        self.cb_enable_tta = QCheckBox("Enable TTA")
+        self.cb_profile_memory = QCheckBox("Profile Memory")
         extra_layout.addWidget(self.cb_pretrained_weights)
         extra_layout.addWidget(self.cb_run_gc)
         extra_layout.addWidget(self.cb_enable_tta)
         extra_layout.addWidget(self.cb_profile_memory)
-        layout.addLayout(extra_layout)
+        container_layout.addWidget(group_extra)
 
-        # 10) CUSTOM MODEL
-        custom_layout = QHBoxLayout()
-        self.cb_load_custom_model = QCheckBox(self.tr("Load Custom Model"))
+        # ========== CUSTOM MODEL GROUP ==========
+        group_custom = QGroupBox("Load Custom Model")
+        custom_layout = QHBoxLayout(group_custom)
+        self.cb_load_custom_model = QCheckBox("Load Custom Model")
         self.custom_model_path_edit = QLineEdit()
-        btn_browse_custom_model = QPushButton(self.tr("Browse Model..."))
+        btn_browse_custom_model = QPushButton("Browse Model...")
         btn_browse_custom_model.clicked.connect(self.browse_custom_model)
         self.custom_arch_file_edit = QLineEdit()
-        browse_arch_btn = QPushButton(self.tr("Browse Arch File..."))
-        browse_arch_btn.clicked.connect(self.browse_arch_file)
+        btn_browse_arch_file = QPushButton("Browse Arch File...")
+        btn_browse_arch_file.clicked.connect(self.browse_arch_file)
 
         custom_layout.addWidget(self.cb_load_custom_model)
-        custom_layout.addWidget(QLabel(self.tr("Weights Path:")))
+        custom_layout.addWidget(QLabel("Weights Path:"))
         custom_layout.addWidget(self.custom_model_path_edit)
         custom_layout.addWidget(btn_browse_custom_model)
-        custom_layout.addWidget(QLabel(self.tr("Arch File:")))
+        custom_layout.addWidget(QLabel("Arch File:"))
         custom_layout.addWidget(self.custom_arch_file_edit)
-        custom_layout.addWidget(browse_arch_btn)
-        layout.addLayout(custom_layout)
+        custom_layout.addWidget(btn_browse_arch_file)
+        container_layout.addWidget(group_custom)
 
-        # 11) EXPORT + LOG
-        self.btn_export_results = QPushButton(self.tr("Export Results"))
+        # ========== EXPORT & PROGRESS ==========
+        h_export = QHBoxLayout()
+        self.btn_export_results = QPushButton("Export Results")
         self.btn_export_results.setEnabled(False)
         self.btn_export_results.clicked.connect(self.export_all_results)
-        layout.addWidget(self.btn_export_results)
+        h_export.addWidget(self.btn_export_results)
+        container_layout.addLayout(h_export)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
-
-        self.text_log = QTextEdit()
-        self.text_log.setReadOnly(True)
-        layout.addWidget(self.text_log)
+        container_layout.addWidget(self.progress_bar)
 
         return self.widget_main
 
     def browse_dataset_folder(self):
-        folder = QFileDialog.getExistingDirectory(self.widget_main, self.tr("Select Dataset Folder"))
+        folder = QFileDialog.getExistingDirectory(self.widget_main, "Select Dataset Folder")
         if folder:
             self.train_data_dir_edit.setText(folder)
 
     def browse_custom_model(self):
-        fpath, _ = QFileDialog.getOpenFileName(self.widget_main, self.tr("Select Custom Model File"), filter="*.pth *.pt")
+        fpath, _ = QFileDialog.getOpenFileName(
+            self.widget_main, "Select Custom Model File",
+            filter="*.pth *.pt"
+        )
         if fpath:
             self.custom_model_path_edit.setText(fpath)
 
     def browse_arch_file(self):
-        fpath, _ = QFileDialog.getOpenFileName(self.widget_main, self.tr("Select Architecture Python File"), filter="*.py")
+        fpath, _ = QFileDialog.getOpenFileName(
+            self.widget_main, "Select Architecture Python File", filter="*.py"
+        )
         if fpath:
             self.custom_arch_file_edit.setText(fpath)
 
     def _parse_common_params(self) -> Tuple[DataConfig, TrainConfig]:
         dataset_dir = self.train_data_dir_edit.text().strip()
         if not os.path.isdir(dataset_dir):
-            raise ValueError(self.tr("Invalid dataset folder."))
+            raise ValueError("Invalid dataset folder.")
 
         val_split = self.val_split_spin.value() / 100.0
         test_split = self.test_split_spin.value() / 100.0
         if val_split + test_split > 1.0:
-            raise ValueError(self.tr("val + test split cannot exceed 100%."))
+            raise ValueError("val + test split cannot exceed 100%.")
 
+        # Parse scheduler params
         scheduler_params_str = self.scheduler_params_edit.text().strip()
         scheduler_params = {}
         if scheduler_params_str:
             parts = scheduler_params_str.split(",")
             for part in parts:
                 if "=" not in part:
-                    raise ValueError(self.tr(f"Invalid scheduler param format: {part}"))
+                    raise ValueError(f"Invalid scheduler param format: {part}")
                 k, v = part.split("=")
-                k, v = k.strip(), v.strip()
-                float_val = float(v)
-                scheduler_params[k] = float_val
+                scheduler_params[k.strip()] = float(v.strip())
 
         data_config = DataConfig(
             root_dir=dataset_dir,
@@ -2285,16 +2591,69 @@ class Plugin(BasePlugin):
 
             load_custom_model=self.cb_load_custom_model.isChecked(),
             custom_model_path=self.custom_model_path_edit.text().strip(),
-            custom_architecture_file=self.custom_arch_file_edit.text().strip()
-        )
+            custom_architecture_file=self.custom_arch_file_edit.text().strip(),
 
+            # Advanced augs
+            random_gamma=self.cb_random_gamma.isChecked(),
+            random_gamma_limit_low=self.spin_gamma_low.value(),
+            random_gamma_limit_high=self.spin_gamma_high.value(),
+            random_gamma_prob=self.spin_gamma_prob.value(),
+
+            clahe=self.cb_clahe.isChecked(),
+            clahe_clip_limit=self.spin_clahe_clip.value(),
+            clahe_tile_size=self.spin_clahe_tile.value(),
+            clahe_prob=self.spin_clahe_prob.value(),
+
+            channel_shuffle=self.cb_channel_shuffle.isChecked(),
+            channel_shuffle_prob=self.spin_channel_shuffle_prob.value(),
+
+            use_posterize_solarize_equalize=self.cb_posterize_solarize_equalize.isChecked(),
+            pse_prob=self.spin_pse_prob.value(),
+            posterize_bits=self.spin_posterize_bits.value(),
+            solarize_threshold=self.spin_solarize_threshold.value(),
+
+            sharpen_denoise=self.cb_sharpen_denoise.isChecked(),
+            sharpen_prob=self.spin_sharpen_prob.value(),
+            sharpen_alpha_min=self.spin_sharpen_alpha_min.value(),
+            sharpen_alpha_max=self.spin_sharpen_alpha_max.value(),
+            sharpen_lightness_min=self.spin_sharpen_lightness_min.value(),
+            sharpen_lightness_max=self.spin_sharpen_lightness_max.value(),
+
+            gauss_vs_mult_noise=self.cb_gauss_vs_mult_noise.isChecked(),
+            gauss_mult_prob=self.spin_gauss_mult_prob.value(),
+            gauss_noise_var_limit_low=self.spin_gauss_var_low.value(),
+            gauss_noise_var_limit_high=self.spin_gauss_var_high.value(),
+            mult_noise_lower=self.spin_mult_lower.value(),
+            mult_noise_upper=self.spin_mult_upper.value(),
+
+            cutout_coarse_dropout=self.cb_cutout_coarse_dropout.isChecked(),
+            cutout_max_holes=self.spin_cutout_max_holes.value(),
+            cutout_max_height=self.spin_cutout_max_height.value(),
+            cutout_max_width=self.spin_cutout_max_width.value(),
+            cutout_prob=self.spin_cutout_prob.value(),
+
+            use_shift_scale_rotate=self.cb_shift_scale_rotate.isChecked(),
+            ssr_shift_limit=self.spin_ssr_shift_limit.value(),
+            ssr_scale_limit=self.spin_ssr_scale_limit.value(),
+            ssr_rotate_limit=self.spin_ssr_rotate_limit.value(),
+            ssr_prob=self.spin_ssr_prob.value(),
+
+            use_one_of_advanced_transforms=self.cb_use_one_of_advanced_transforms.isChecked(),
+            one_of_advanced_transforms_prob=self.spin_one_of_adv_prob.value(),
+
+            # RandAugment
+            use_randaugment=self.cb_randaugment.isChecked(),
+
+            # NEW: persistent_workers
+            persistent_workers=self.cb_persistent_workers.isChecked()
+        )
         return data_config, train_config
 
     def start_training(self):
         try:
             data_config, train_config = self._parse_common_params()
         except ValueError as e:
-            QMessageBox.warning(self.widget_main, self.tr("Invalid Input"), str(e))
+            QMessageBox.warning(self.widget_main, "Invalid Input", str(e))
             return
 
         self.btn_train.setEnabled(False)
@@ -2302,19 +2661,56 @@ class Plugin(BasePlugin):
         self.btn_export_results.setEnabled(False)
         self.progress_bar.setVisible(True)
 
+        # Prepare manager dict for results
+        self.train_result_manager = multiprocessing.Manager()
+        self.train_result_dict = self.train_result_manager.dict()
+
         data_dict = data_config.__dict__
         train_dict = train_config.__dict__
 
-        self.train_thread = TrainThread(data_dict, train_dict)
-        self.train_thread.log_signal.connect(self.append_log)
-        self.train_thread.done_signal.connect(self.train_finished)
-        self.train_thread.start()
+        # Start process
+        self.train_process = multiprocessing.Process(
+            target=train_worker,
+            args=(data_dict, train_dict, self.train_result_dict)
+        )
+        self.train_process.start()
+
+        # Start a QTimer to poll for results
+        self.training_timer = QTimer()
+        self.training_timer.timeout.connect(self.check_train_process)
+        self.training_timer.start(1000)
+
+    def check_train_process(self):
+        if self.train_process is not None:
+            if not self.train_process.is_alive():
+                # Process finished
+                self.train_process.join()
+                self.train_process = None
+                self.training_timer.stop()
+                self.train_finished()
+
+    def train_finished(self):
+        self.progress_bar.setVisible(False)
+        self.btn_train.setEnabled(True)
+        self.btn_tune_optuna.setEnabled(True)
+
+        status = self.train_result_dict.get("status", "ERROR")
+        if status == "OK":
+            self.best_ckpt_path = self.train_result_dict["ckpt_path"]
+            self.last_test_metrics = self.train_result_dict["test_metrics"]
+            self.btn_export_results.setEnabled(True)
+            print(f"[INFO] Training finished. Best checkpoint: {self.best_ckpt_path}")
+        else:
+            print("[ERROR] Training encountered an error.")
+
+        self.train_result_manager = None
+        self.train_result_dict = None
 
     def start_optuna_tuning(self):
         try:
             data_config, base_train_config = self._parse_common_params()
         except ValueError as e:
-            QMessageBox.warning(self.widget_main, self.tr("Invalid Input"), str(e))
+            QMessageBox.warning(self.widget_main, "Invalid Input", str(e))
             return
 
         self.btn_train.setEnabled(False)
@@ -2322,73 +2718,49 @@ class Plugin(BasePlugin):
         self.btn_export_results.setEnabled(False)
         self.progress_bar.setVisible(True)
 
+        self.optuna_result_manager = multiprocessing.Manager()
+        self.optuna_result_dict = self.optuna_result_manager.dict()
+
         data_dict = data_config.__dict__
         base_train_dict = base_train_config.__dict__
-
         n_trials = self.optuna_trials_spin.value()
         timeout = self.optuna_timeout_spin.value()
         use_test_metric_for_optuna = self.cb_optuna_use_test_metric.isChecked()
 
-        self.optuna_thread = OptunaTrainThread(
-            data_dict, base_train_dict,
-            n_trials, timeout,
-            use_test_metric_for_optuna=use_test_metric_for_optuna
+        self.optuna_process = multiprocessing.Process(
+            target=optuna_worker,
+            args=(data_dict, base_train_dict, n_trials, timeout, use_test_metric_for_optuna, self.optuna_result_dict)
         )
-        self.optuna_thread.log_signal.connect(self.append_log)
-        self.optuna_thread.done_signal.connect(self.optuna_tuning_finished)
-        self.optuna_thread.start()
+        self.optuna_process.start()
 
-    def train_finished(self, ckpt_path: str, test_metrics: dict):
+        self.optuna_timer = QTimer()
+        self.optuna_timer.timeout.connect(self.check_optuna_process)
+        self.optuna_timer.start(1000)
+
+    def check_optuna_process(self):
+        if self.optuna_process is not None:
+            if not self.optuna_process.is_alive():
+                self.optuna_process.join()
+                self.optuna_process = None
+                self.optuna_timer.stop()
+                self.optuna_tuning_finished()
+
+    def optuna_tuning_finished(self):
         self.progress_bar.setVisible(False)
         self.btn_train.setEnabled(True)
         self.btn_tune_optuna.setEnabled(True)
 
-        if ckpt_path != "ERROR":
-            self.best_ckpt_path = ckpt_path
-            self.last_test_metrics = test_metrics
+        status = self.optuna_result_dict.get("status", "ERROR")
+        if status == "OK":
+            self.best_ckpt_path = self.optuna_result_dict["ckpt_path"]
+            self.last_test_metrics = self.optuna_result_dict["test_metrics"]
             self.btn_export_results.setEnabled(True)
-            self.append_log(f"Training finished. Best checkpoint: {ckpt_path}\n")
-
-            cm = test_metrics.get("confusion_matrix")
-            if cm:
-                self.append_log(f"Confusion Matrix:\n{cm}\n")
-            cr = test_metrics.get("class_report")
-            if cr:
-                self.append_log(f"Classification Report:\n{cr}\n")
-            auc_roc = test_metrics.get("auc_roc")
-            if auc_roc is not None:
-                self.append_log(f"AUC-ROC: {auc_roc:.4f}\n")
+            print(f"[INFO] Optuna tuning finished. Best checkpoint: {self.best_ckpt_path}")
         else:
-            self.append_log("Training encountered an error.\n")
+            print("[ERROR] Optuna tuning encountered an error.")
 
-    def optuna_tuning_finished(self, ckpt_path: str, test_metrics: dict):
-        self.progress_bar.setVisible(False)
-        self.btn_train.setEnabled(True)
-        self.btn_tune_optuna.setEnabled(True)
-
-        if ckpt_path != "ERROR":
-            self.best_ckpt_path = ckpt_path
-            self.last_test_metrics = test_metrics
-            self.btn_export_results.setEnabled(True)
-            self.append_log(f"Optuna tuning finished. Best checkpoint: {ckpt_path}\n")
-
-            cm = test_metrics.get("confusion_matrix")
-            if cm:
-                self.append_log(f"Confusion Matrix:\n{cm}\n")
-            cr = test_metrics.get("class_report")
-            if cr:
-                self.append_log(f"Classification Report:\n{cr}\n")
-            auc_roc = test_metrics.get("auc_roc")
-            if auc_roc is not None:
-                self.append_log(f"AUC-ROC: {auc_roc:.4f}\n")
-        else:
-            self.append_log("Optuna tuning encountered an error.\n")
-
-    def append_log(self, msg: str):
-        if self.text_log:
-            self.text_log.append(msg)
-            self.text_log.ensureCursorVisible()
-        logger.info(msg.strip())
+        self.optuna_result_manager = None
+        self.optuna_result_dict = None
 
     def export_all_results(self):
         if not self.last_test_metrics:
@@ -2404,8 +2776,8 @@ class Plugin(BasePlugin):
         cm = self.last_test_metrics.get("confusion_matrix")
         cr = self.last_test_metrics.get("class_report")
         auc_roc = self.last_test_metrics.get("auc_roc")
-        tb_log_dir = self.last_test_metrics.get("tb_log_dir")
         cm_fig_path = self.last_test_metrics.get("cm_fig_path")
+        tb_log_dir = self.last_test_metrics.get("tb_log_dir")
 
         with open(fpath, "w", encoding="utf-8") as f:
             f.write("=== CNN Training Exported Results ===\n\n")
@@ -2419,7 +2791,7 @@ class Plugin(BasePlugin):
         if tb_log_dir and os.path.isdir(tb_log_dir):
             zip_base = os.path.splitext(fpath)[0] + "_tb_logs"
             shutil.make_archive(zip_base, 'zip', tb_log_dir)
-            self.append_log(f"TensorBoard logs exported to {zip_base}.zip\n")
+            print(f"[INFO] TensorBoard logs exported to {zip_base}.zip")
 
         QMessageBox.information(
             self.widget_main,
@@ -2429,7 +2801,7 @@ class Plugin(BasePlugin):
 
 
 # ===============================
-# 9) UNIT & INTEGRATION TESTS
+# 10) UNIT & INTEGRATION TESTS
 # ===============================
 class TestCorruptImages(unittest.TestCase):
     def test_gather_samples_corrupt_folder(self):
