@@ -5,8 +5,10 @@ import glob
 import time
 import traceback
 import json
+import csv
 import cv2
 import torch
+import logging
 import numpy as np
 
 import albumentations as A
@@ -49,7 +51,7 @@ import matplotlib
 matplotlib.use("Agg")  # Use a non-interactive backend
 import matplotlib.pyplot as plt
 
-# For classification metrics
+# Classification metrics
 from sklearn.metrics import (
     confusion_matrix, classification_report, roc_curve, auc,
     precision_recall_curve, average_precision_score, roc_auc_score,
@@ -58,14 +60,14 @@ from sklearn.metrics import (
 from sklearn.preprocessing import label_binarize
 from sklearn.calibration import calibration_curve
 
-# Try importing SHAP
+# SHAP
 try:
     import shap
     HAVE_SHAP = True
 except ImportError:
     HAVE_SHAP = False
 
-# For optional interactive plots with Plotly
+# Plotly
 try:
     import plotly.express as px
     import plotly.graph_objects as go
@@ -73,20 +75,12 @@ try:
 except ImportError:
     HAVE_PLOTLY = False
 
-# For optional temp file usage (e.g., opening overlay in default viewer)
 import tempfile
-import csv
 
 
 def convert_to_qpixmap(numpy_image: np.ndarray) -> QPixmap:
     """
     Converts a BGR or RGB NumPy image into a QPixmap for PyQt display.
-
-    Args:
-        numpy_image (np.ndarray): Image array of shape (H, W, 3), BGR or RGB.
-
-    Returns:
-        QPixmap: The converted image ready for QLabel display.
     """
     array_copied = np.ascontiguousarray(numpy_image)
     height, width, channels = array_copied.shape
@@ -105,15 +99,6 @@ def overlay_cam_on_image(
     """
     Applies a Grad-CAM or Grad-CAM++ heatmap to the original BGR image.
     'cam' should be normalized between 0 and 1.
-
-    Args:
-        image (np.ndarray): Original BGR image (H, W, 3).
-        cam (np.ndarray): CAM map (H, W) normalized to [0,1].
-        alpha (float): Overlay transparency ratio.
-        colormap (int): OpenCV colormap to apply.
-
-    Returns:
-        np.ndarray: The resulting BGR overlay, shape (H, W, 3).
     """
     heatmap = cv2.applyColorMap(np.uint8(cam * 255), colormap)
     heatmap = heatmap.astype(np.float32) / 255.0
@@ -128,11 +113,9 @@ def overlay_cam_on_image(
 
 class GradCAM:
     """
-    A basic Grad-CAM implementation, hooking a specified model layer.
-    For more details, see the original Grad-CAM paper:
-    https://arxiv.org/abs/1610.02391
+    Basic Grad-CAM implementation, hooking a specified model layer.
+    Reference: https://arxiv.org/abs/1610.02391
     """
-
     def __init__(self, model: torch.nn.Module, target_layer: torch.nn.Module):
         self.model = model
         self.target_layer = target_layer
@@ -150,17 +133,9 @@ class GradCAM:
         self.target_layer.register_forward_hook(forward_hook)
         self.target_layer.register_backward_hook(backward_hook)
 
-    def generate_cam(self, input_tensor: torch.Tensor, target_class: int = None):
+    def generate_cam(self, input_tensor: torch.Tensor, target_class: int = None) -> np.ndarray:
         """
         Generates a Grad-CAM heatmap for the specified target_class.
-
-        Args:
-            input_tensor (torch.Tensor): The input tensor of shape (1, C, H, W).
-            target_class (int): Which class index to target.
-                                If None, uses argmax of logits.
-
-        Returns:
-            np.ndarray: The CAM map (H, W), normalized to [0,1].
         """
         with torch.enable_grad():
             logits = self.model(input_tensor)
@@ -171,14 +146,13 @@ class GradCAM:
             score = logits[0, target_class]
             score.backward()
 
-        # (C, H, W)
         gradients = self.gradients[0]
         activations = self.activations[0]
 
         # Global average pooling of gradients
-        alpha = gradients.mean(dim=[1, 2], keepdim=True)  # shape (C,1,1)
+        alpha = gradients.mean(dim=[1, 2], keepdim=True)
         weighted_activations = alpha * activations
-        cam = weighted_activations.sum(dim=0)  # shape (H, W)
+        cam = weighted_activations.sum(dim=0)
         cam = torch.relu(cam)
 
         # Normalize to [0,1]
@@ -191,22 +165,9 @@ class GradCAM:
 
 class GradCAMPlusPlus(GradCAM):
     """
-    A Grad-CAM++ implementation, which improves on Grad-CAM by weighting
-    the activations differently. Reference: https://arxiv.org/abs/1710.11063
+    Grad-CAM++ implementation: https://arxiv.org/abs/1710.11063
     """
-
-    def generate_cam(self, input_tensor: torch.Tensor, target_class: int = None):
-        """
-        Generates a Grad-CAM++ heatmap for the specified target_class.
-
-        Args:
-            input_tensor (torch.Tensor): The input tensor of shape (1, C, H, W).
-            target_class (int): Which class index to target.
-                                If None, uses argmax of logits.
-
-        Returns:
-            np.ndarray: The CAM map (H, W), normalized to [0,1].
-        """
+    def generate_cam(self, input_tensor: torch.Tensor, target_class: int = None) -> np.ndarray:
         with torch.enable_grad():
             logits = self.model(input_tensor)
             if target_class is None:
@@ -216,8 +177,8 @@ class GradCAMPlusPlus(GradCAM):
             score = logits[0, target_class]
             score.backward()
 
-        gradients = self.gradients[0]    # shape (C, H, W)
-        activations = self.activations[0]  # shape (C, H, W)
+        gradients = self.gradients[0]
+        activations = self.activations[0]
 
         grads_power_2 = gradients ** 2
         grads_power_3 = gradients ** 3
@@ -228,7 +189,6 @@ class GradCAMPlusPlus(GradCAM):
                 torch.sum(activations * grads_power_3, dim=[1, 2], keepdim=True) / \
                 (torch.sum(activations * gradients, dim=[1, 2], keepdim=True) + eps)
 
-        # alpha weights
         alpha = grads_power_2 / (denom + eps)
         pos_grad = torch.relu(gradients)
         weights = (alpha * pos_grad).mean(dim=[1, 2], keepdim=True)
@@ -243,25 +203,181 @@ class GradCAMPlusPlus(GradCAM):
         return cam.cpu().numpy()
 
 
+class XGradCAM(GradCAM):
+    """
+    Another Grad-CAM variant (XGrad-CAM).
+    Reference: https://arxiv.org/abs/1904.00645
+    """
+    def generate_cam(self, input_tensor: torch.Tensor, target_class: int = None) -> np.ndarray:
+        with torch.enable_grad():
+            logits = self.model(input_tensor)
+            if target_class is None:
+                target_class = torch.argmax(logits, dim=1).item()
+
+            self.model.zero_grad()
+            score = logits[0, target_class]
+            score.backward()
+
+        gradients = self.gradients[0]
+        activations = self.activations[0]
+
+        # XGradCAM weighting
+        alpha = (gradients * activations).mean(dim=[1, 2], keepdim=True)
+        cam = torch.sum(alpha * activations, dim=0)
+        cam = torch.relu(cam)
+
+        cam -= cam.min()
+        if cam.max() != 0:
+            cam /= cam.max()
+
+        return cam.cpu().numpy()
+
+
+class QTextEditLogger(logging.Handler):
+    """
+    A logging handler that sends logs to a PyQt QTextEdit widget.
+    """
+    def __init__(self, text_edit: QTextEdit):
+        super().__init__()
+        self.text_edit = text_edit
+
+    def emit(self, record: logging.LogRecord):
+        msg = self.format(record)
+        self.text_edit.append(msg)
+        self.text_edit.ensureCursorVisible()
+
+
+class SingleInferenceThread(QThread):
+    """
+    Threaded single-image inference.
+    """
+    progress_signal = pyqtSignal(str)
+    done_signal = pyqtSignal(object, object, str)
+
+    def __init__(
+        self,
+        bgr_image: np.ndarray,
+        model: torch.nn.Module,
+        device: torch.device,
+        transform: A.Compose,
+        cam_variant: str,
+        target_layer: torch.nn.Module,
+        top_k: int = 1,
+        min_conf: float = 10.0,
+        overlay_alpha: float = 0.5,
+        colormap_id: int = cv2.COLORMAP_JET,
+        do_gradcam: bool = True,
+        class_names: list = None,
+        parent=None
+    ):
+        super().__init__(parent)
+        self.bgr_image = bgr_image
+        self.model = model
+        self.device = device
+        self.transform = transform
+        self.cam_variant = cam_variant
+        self.target_layer = target_layer
+        self.top_k = top_k
+        self.min_conf = min_conf
+        self.overlay_alpha = overlay_alpha
+        self.colormap_id = colormap_id
+        self.do_gradcam = do_gradcam
+        self.class_names = class_names
+
+        self.overlay_result = None
+        self.label_str = None
+
+    def run(self):
+        try:
+            rgb_img = cv2.cvtColor(self.bgr_image, cv2.COLOR_BGR2RGB)
+            aug = self.transform(image=rgb_img)
+            input_tensor = aug["image"].unsqueeze(0).to(self.device)
+
+            self.progress_signal.emit("Running forward pass...")
+            with torch.no_grad():
+                if self.device.type == 'cuda':
+                    try:
+                        with torch.cuda.amp.autocast():
+                            logits = self.model(input_tensor)
+                    except RuntimeError as oom_e:
+                        if "out of memory" in str(oom_e).lower():
+                            self.progress_signal.emit("[ERROR] CUDA OOM in single inference.")
+                            self.done_signal.emit(None, self.bgr_image, "OOM Error.")
+                            return
+                        else:
+                            raise
+                else:
+                    logits = self.model(input_tensor)
+
+                probs = torch.softmax(logits, dim=1)
+
+            topk_vals, topk_indices = torch.topk(probs, k=self.top_k, dim=1)
+            result_items = []
+
+            if self.class_names:
+                n_classes = len(self.class_names)
+            else:
+                n_classes = None
+
+            for rank in range(topk_vals.size(1)):
+                cls_idx = topk_indices[0, rank].item()
+                conf = topk_vals[0, rank].item() * 100.0
+                if n_classes and cls_idx < n_classes:
+                    cls_name = self.class_names[cls_idx]
+                else:
+                    cls_name = f"Class {cls_idx}"
+
+                if conf < self.min_conf:
+                    label_conf_str = f"Uncertain (<{self.min_conf:.1f}%)"
+                else:
+                    label_conf_str = f"{cls_name} ({conf:.1f}%)"
+                result_items.append(label_conf_str)
+
+            self.label_str = " | ".join(result_items)
+
+            # Grad-CAM overlay if requested
+            if self.do_gradcam and self.target_layer is not None:
+                if self.cam_variant == "Grad-CAM++":
+                    gradcam_obj = GradCAMPlusPlus(self.model, self.target_layer)
+                elif self.cam_variant == "XGradCAM":
+                    gradcam_obj = XGradCAM(self.model, self.target_layer)
+                else:
+                    gradcam_obj = GradCAM(self.model, self.target_layer)
+
+                pred_class = topk_indices[0, 0].item()
+                input_tensor.requires_grad = True
+                cam_map = gradcam_obj.generate_cam(input_tensor, target_class=pred_class)
+                cam_resized = cv2.resize(cam_map, (self.bgr_image.shape[1], self.bgr_image.shape[0]))
+                overlay = overlay_cam_on_image(
+                    self.bgr_image, cam_resized,
+                    alpha=self.overlay_alpha,
+                    colormap=self.colormap_id
+                )
+                self.overlay_result = overlay
+            else:
+                self.overlay_result = None
+
+            self.done_signal.emit(self.overlay_result, self.bgr_image, self.label_str)
+
+        except Exception as e:
+            traceback_str = traceback.format_exc()
+            self.progress_signal.emit(f"[ERROR] Single Inference failed: {e}\n{traceback_str}")
+            self.done_signal.emit(None, self.bgr_image, f"Error: {e}")
+
+
 class BatchInferenceThread(QThread):
     """
-    A QThread to handle potentially large batch inference without freezing the UI.
-
-    Emits:
-        - progress_signal(int): indicates the current progress index.
-        - log_signal(str): logs messages to the UI.
-        - done_signal(str, dict): final signal with results_dir and metrics_dict.
-          results_dir = 'ERROR' in case of error.
+    Threaded batch inference.
     """
     progress_signal = pyqtSignal(int)
     log_signal = pyqtSignal(str)
-    done_signal = pyqtSignal(str, dict)  # results_dir, metrics_dict
+    done_signal = pyqtSignal(str, dict)
 
-    def __init__(self, params, parent=None):
+    def __init__(self, params: dict, parent=None):
         super().__init__(parent)
         self.params = params
         self._cancelled = False
-        self.gradcam_cache = {}  # cache for Grad-CAM maps
+        self.gradcam_cache = {}
 
     def run(self):
         try:
@@ -273,11 +389,8 @@ class BatchInferenceThread(QThread):
             return
 
     def run_batch_inference(self):
-        """
-        Actual batch inference logic, pulling from self.params to do the job,
-        including mini-batched classification, optional Grad-CAM generation,
-        and metrics computation.
-        """
+        logger = logging.getLogger(__name__)
+
         model = self.params["model"].to(self.params["device"]).eval()
         target_layer = self.params["target_layer"]
         device = self.params["device"]
@@ -297,8 +410,10 @@ class BatchInferenceThread(QThread):
         shap_samples = self.params["shap_samples"]
         shap_bg = self.params["shap_bg"]
         batch_size = self.params.get("batch_size", 1)
-
-        colormap = cv2.COLORMAP_JET
+        compute_advanced_metrics = self.params.get("compute_advanced_metrics", True)
+        skip_shap_if_large = self.params.get("skip_shap_if_large", 1024)
+        cam_variant = self.params.get("cam_variant", "Grad-CAM")
+        colormap_id = self.params.get("colormap_id", cv2.COLORMAP_JET)
 
         gt_dict = self.load_ground_truth_dict(gt_csv_path)
         exts = ("*.tiff", "*.tif", "*.png", "*.jpg", "*.jpeg")
@@ -311,7 +426,6 @@ class BatchInferenceThread(QThread):
             self.done_signal.emit("DONE", {})
             return
 
-        # create output dir
         os.makedirs(out_dir, exist_ok=True)
         cam_dir = os.path.join(out_dir, "inference_cam")
         if do_gradcam:
@@ -332,9 +446,8 @@ class BatchInferenceThread(QThread):
             class_to_idx = {}
             num_classes = None
 
-        pdf_export = True  # you can control this from UI if desired
+        pdf_export = True
 
-        # Logging to file
         log_file = os.path.join(out_dir, "batch_inference_log.txt")
         with open(log_file, "w", encoding="utf-8") as lf:
             lf.write("Batch Inference Log\n\n")
@@ -358,7 +471,6 @@ class BatchInferenceThread(QThread):
                 input_tensors = []
                 valid_indices_in_batch = []
 
-                # Attempt to load/transform each image in this mini-batch
                 for i, img_path in enumerate(batch_paths):
                     if self._cancelled:
                         self.log_signal.emit("[INFO] Batch inference was cancelled mid-batch.")
@@ -372,6 +484,11 @@ class BatchInferenceThread(QThread):
                             )
                             self.progress_signal.emit(start_idx + i + 1)
                             continue
+
+                        # Check dimension if skipping SHAP for large images
+                        if do_shap and (bgr_img.shape[0] > skip_shap_if_large or bgr_img.shape[1] > skip_shap_if_large):
+                            self.log_signal.emit(f"[INFO] Skipping SHAP for large image: {img_path}")
+
                         tensor = self._transform_image(bgr_img, transform)
                         input_tensors.append(tensor)
                         valid_indices_in_batch.append(i)
@@ -389,14 +506,30 @@ class BatchInferenceThread(QThread):
                 input_batch = torch.stack(input_tensors).to(device)
 
                 start_time = time.time()
-                with torch.no_grad():
-                    if device.type == 'cuda':
-                        with torch.cuda.amp.autocast():
+                try:
+                    with torch.no_grad():
+                        if device.type == 'cuda':
+                            try:
+                                with torch.cuda.amp.autocast():
+                                    logits = model(input_batch)
+                            except RuntimeError as oom_e:
+                                if "out of memory" in str(oom_e).lower():
+                                    self.log_signal.emit("[ERROR] CUDA OOM in batch. Attempting to continue.")
+                                    self.progress_signal.emit(start_idx + len(batch_paths))
+                                    del input_batch
+                                    torch.cuda.empty_cache()
+                                    continue
+                                else:
+                                    raise
+                        else:
                             logits = model(input_batch)
-                    else:
-                        logits = model(input_batch)
+                        probs = torch.softmax(logits, dim=1)
+                except Exception as e:
+                    self.log_signal.emit(f"[ERROR] Failure during forward pass: {e}")
+                    del input_batch
+                    torch.cuda.empty_cache()
+                    continue
 
-                    probs = torch.softmax(logits, dim=1)
                 end_time = time.time()
                 elapsed_ms_total = (end_time - start_time) * 1000.0
                 elapsed_per_item = elapsed_ms_total / max(len(valid_indices_in_batch), 1)
@@ -405,7 +538,6 @@ class BatchInferenceThread(QThread):
                 if device.type == 'cuda':
                     torch.cuda.empty_cache()
 
-                # For each valid image in this batch, gather results
                 for local_i, global_i in enumerate(valid_indices_in_batch):
                     idx_global = start_idx + global_i
                     img_path = batch_paths[global_i]
@@ -433,7 +565,6 @@ class BatchInferenceThread(QThread):
                     all_preds.append(pred_class)
                     all_probs.append(prob_vector.cpu().numpy())
 
-                    # ground truth
                     base_name = os.path.basename(img_path)
                     gt_label_str = None
                     gt_index = -1
@@ -477,12 +608,14 @@ class BatchInferenceThread(QThread):
 
                     # Grad-CAM if requested
                     if do_gradcam and target_layer is not None:
-                        cam_key = (img_path, pred_class, "gradcam++" if use_gradcam_pp else "gradcam")
+                        cam_key = (img_path, pred_class, cam_variant)
                         if cam_key in self.gradcam_cache:
                             cam_map = self.gradcam_cache[cam_key]
                         else:
-                            if use_gradcam_pp:
+                            if cam_variant == "Grad-CAM++":
                                 gradcam_obj = GradCAMPlusPlus(model, target_layer)
+                            elif cam_variant == "XGradCAM":
+                                gradcam_obj = XGradCAM(model, target_layer)
                             else:
                                 gradcam_obj = GradCAM(model, target_layer)
 
@@ -504,7 +637,7 @@ class BatchInferenceThread(QThread):
                             overlay_img = overlay_cam_on_image(
                                 bgr_img, cam_resized,
                                 alpha=overlay_alpha,
-                                colormap=colormap
+                                colormap=colormap_id
                             )
                             out_path = os.path.join(cam_dir, f"CAM_{os.path.basename(img_path)}")
                             cv2.imwrite(out_path, overlay_img)
@@ -514,7 +647,6 @@ class BatchInferenceThread(QThread):
             if csv_out:
                 csv_out.close()
 
-        # Misclassified samples CSV
         if misclassified_samples:
             mc_file = os.path.join(out_dir, "misclassified.csv")
             with open(mc_file, "w", encoding="utf-8", newline="") as f_mc:
@@ -523,10 +655,9 @@ class BatchInferenceThread(QThread):
                 for row in misclassified_samples:
                     writer.writerow(row)
 
-        # Metrics
         metrics_dict = {}
         valid_inds = [i for i, t in enumerate(all_targets) if t != -1]
-        if valid_inds:
+        if valid_inds and compute_advanced_metrics:
             y_true = [all_targets[i] for i in valid_inds]
             y_pred = [all_preds[i] for i in valid_inds]
             y_prob = [all_probs[i] for i in valid_inds]
@@ -538,7 +669,6 @@ class BatchInferenceThread(QThread):
                 f_cm.write(str(cm))
                 f_cm.write("\n")
 
-            # classification report
             if class_names and max(y_true) < len(class_names):
                 cls_rep_str = classification_report(y_true, y_pred, target_names=class_names)
                 cls_rep_dict = classification_report(y_true, y_pred, target_names=class_names, output_dict=True)
@@ -552,7 +682,6 @@ class BatchInferenceThread(QThread):
                 f_rep.write(cls_rep_str)
                 f_rep.write("\n")
 
-            # Plot confusion matrix (matplotlib)
             plt.figure(figsize=(6, 5))
             plt.imshow(cm, cmap="Blues")
             plt.title("Confusion Matrix")
@@ -570,11 +699,9 @@ class BatchInferenceThread(QThread):
                 plt.savefig(os.path.join(out_dir, "confusion_matrix.pdf"))
             plt.close()
 
-            # Optionally create an interactive confusion matrix with Plotly
-            if HAVE_PLOTLY:
+            if HAVE_PLOTLY and class_names and max(y_true) < len(class_names):
                 self.plotly_confusion_matrix(cm, class_names, out_dir)
 
-            # Confidence histogram
             top1_conf_all = [max(prob_vec) for prob_vec in y_prob]
             plt.figure()
             plt.hist(top1_conf_all, bins=20, range=(0, 1), color='green', alpha=0.7)
@@ -587,7 +714,10 @@ class BatchInferenceThread(QThread):
                 plt.savefig(os.path.join(out_dir, "confidence_histogram.pdf"))
             plt.close()
 
-            # Additional metrics
+            roc_auc_overall = None
+            pr_auc_val = None
+            mcc_val = matthews_corrcoef(y_true, y_pred)
+
             if num_classes == 2:
                 y_prob_pos = [p[1] for p in y_prob]
                 fpr, tpr, _ = roc_curve(y_true, y_prob_pos, pos_label=1)
@@ -606,7 +736,6 @@ class BatchInferenceThread(QThread):
                 if HAVE_PLOTLY:
                     self.plotly_roc_curve(fpr, tpr, roc_auc_val, out_dir)
 
-                # PR
                 precision, recall, _ = precision_recall_curve(y_true, y_prob_pos)
                 avg_prec = average_precision_score(y_true, y_prob_pos)
                 plt.figure()
@@ -621,7 +750,6 @@ class BatchInferenceThread(QThread):
                     plt.savefig(os.path.join(out_dir, "pr_curve.pdf"))
                 plt.close()
 
-                # calibration curve
                 fraction_of_positives, mean_predicted_value = calibration_curve(y_true, y_prob_pos, n_bins=10)
                 plt.figure()
                 plt.plot(mean_predicted_value, fraction_of_positives, "s-", label="Model")
@@ -640,7 +768,6 @@ class BatchInferenceThread(QThread):
                     roc_auc_overall = roc_auc_score(y_true, y_prob_pos)
                 except:
                     roc_auc_overall = None
-                mcc_val = matthews_corrcoef(y_true, y_pred)
                 pr_auc_val = avg_prec
 
             elif num_classes and num_classes > 2:
@@ -660,13 +787,7 @@ class BatchInferenceThread(QThread):
                     class_names=class_names,
                     pdf_export=pdf_export
                 )
-                mcc_val = matthews_corrcoef(y_true, y_pred)
-            else:
-                roc_auc_overall = None
-                pr_auc_val = None
-                mcc_val = matthews_corrcoef(y_true, y_pred)
 
-            # SHAP
             if do_shap:
                 if HAVE_SHAP:
                     shap_files = [image_files[i] for i in valid_inds]
@@ -674,7 +795,7 @@ class BatchInferenceThread(QThread):
                     try:
                         self.run_shap_analysis(
                             model, device, shap_files, transform,
-                            shap_samples, shap_bg, shap_file_out
+                            shap_samples, shap_bg, shap_file_out, skip_shap_if_large
                         )
                     except Exception as e:
                         self.log_signal.emit(f"[WARNING] SHAP error: {e}")
@@ -684,21 +805,17 @@ class BatchInferenceThread(QThread):
             metrics_dict["confusion_matrix"] = cm
             metrics_dict["class_report"] = cls_rep_str
 
-            # Save key metrics to JSON
             self.save_metrics_to_json(cm, cls_rep_dict, mcc_val, roc_auc_overall, pr_auc_val, out_dir)
 
         self.log_signal.emit("[INFO] Batch Inference Done.")
         self.done_signal.emit(out_dir, metrics_dict)
 
     def _transform_image(self, bgr_img: np.ndarray, transform: A.Compose) -> torch.Tensor:
-        """
-        Helper to convert BGR image to RGB, apply Albumentations transforms, and return a tensor.
-        """
         rgb_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
         aug = transform(image=rgb_img)
         return aug["image"]
 
-    def load_ground_truth_dict(self, csv_file: str):
+    def load_ground_truth_dict(self, csv_file: str) -> dict:
         gt_dict = {}
         if not csv_file or not os.path.isfile(csv_file):
             return gt_dict
@@ -732,7 +849,6 @@ class BatchInferenceThread(QThread):
                 plt.plot(fpr, tpr, label=f"{class_names[c]}")
             else:
                 plt.plot(fpr, tpr, label=f"Class {c}")
-
         plt.plot([0, 1], [0, 1], "r--")
         if roc_auc is not None:
             plt.title(f"Multi-class ROC ({average} avg AUC={roc_auc:.3f})")
@@ -781,24 +897,29 @@ class BatchInferenceThread(QThread):
 
     def run_shap_analysis(
             self, model, device, image_files, transform,
-            shap_samples, shap_bg, shap_outfile
+            shap_samples, shap_bg, shap_outfile, skip_shap_if_large
     ):
-        """
-        Run SHAP analysis on a subset of images.
-        """
-        sample_files = image_files[:shap_samples]
-        background_files = image_files[:shap_bg] if shap_bg > 0 else sample_files[:1]
+        sample_files = []
+        for fimg in image_files[:shap_samples]:
+            bgr = cv2.imread(fimg)
+            if bgr is None:
+                continue
+            if bgr.shape[0] > skip_shap_if_large or bgr.shape[1] > skip_shap_if_large:
+                continue
+            sample_files.append(fimg)
+
+        background_files = sample_files[:shap_bg] if shap_bg > 0 else sample_files[:1]
 
         shap_list = []
-        for fimg in sample_files:
-            bgr = cv2.imread(fimg)
+        for fpath in sample_files:
+            bgr = cv2.imread(fpath)
             if bgr is None:
                 continue
             shap_list.append(self._transform_image(bgr, transform))
 
         bg_list = []
-        for fimg in background_files:
-            bgr = cv2.imread(fimg)
+        for fpath in background_files:
+            bgr = cv2.imread(fpath)
             if bgr is None:
                 continue
             bg_list.append(self._transform_image(bgr, transform))
@@ -812,6 +933,7 @@ class BatchInferenceThread(QThread):
             bg_list = shap_list[:1]
         bg_tensor = torch.stack(bg_list, dim=0).to(device)
 
+        self.log_signal.emit("[INFO] Running SHAP DeepExplainer...")
         explainer = shap.DeepExplainer(model, bg_tensor)
         shap_values = explainer.shap_values(shap_tensor)
 
@@ -845,48 +967,39 @@ class BatchInferenceThread(QThread):
             "roc_auc": roc_auc_val,
             "pr_auc": pr_auc_val
         }
-
         out_path = os.path.join(out_dir, "metrics.json")
         with open(out_path, "w", encoding="utf-8") as fp:
             json.dump(data, fp, indent=2)
 
     def plotly_confusion_matrix(self, cm, class_names, out_dir):
-        """
-        Example of generating an interactive confusion matrix with Plotly,
-        saved as an HTML file.
-        """
         if not HAVE_PLOTLY:
             return
-
-        fig = px.imshow(cm,
-                        text_auto=True,
-                        labels=dict(x="Predicted", y="True", color="Count"),
-                        x=class_names, y=class_names)
+        fig = px.imshow(
+            cm,
+            text_auto=True,
+            labels=dict(x="Predicted", y="True", color="Count"),
+            x=class_names, y=class_names
+        )
         fig.update_layout(title="Confusion Matrix (Interactive)")
         plot_file = os.path.join(out_dir, "confusion_matrix_plotly.html")
         fig.write_html(plot_file)
 
     def plotly_roc_curve(self, fpr, tpr, roc_auc_val, out_dir):
-        """
-        Example of generating a Plotly ROC curve and saving as HTML.
-        """
         if not HAVE_PLOTLY:
             return
-
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name=f'ROC (AUC={roc_auc_val:.3f})'))
         fig.add_shape(type='line', x0=0, y0=0, x1=1, y1=1,
                       line=dict(color='red', dash='dash'))
-        fig.update_layout(title="ROC Curve (Interactive)",
-                          xaxis_title='False Positive Rate',
-                          yaxis_title='True Positive Rate')
+        fig.update_layout(
+            title="ROC Curve (Interactive)",
+            xaxis_title='False Positive Rate',
+            yaxis_title='True Positive Rate'
+        )
         plot_file = os.path.join(out_dir, "roc_curve_plotly.html")
         fig.write_html(plot_file)
 
     def log_with_timestamp(self, message, logfile, level="INFO"):
-        """
-        Helper to log messages with timestamps and levels.
-        """
         now_str = QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss")
         log_str = f"[{now_str}][{level}] {message}"
         self.log_signal.emit(log_str)
@@ -896,30 +1009,21 @@ class BatchInferenceThread(QThread):
     def cancel(self):
         self._cancelled = True
 
-    def compute_custom_metrics(self, y_true, y_pred, y_prob):
-        """
-        Placeholder for your custom metrics. Return a dictionary if needed.
-        """
-        custom_m = {}
-        return custom_m
-
 
 class Plugin(BasePlugin):
     """
-    Updated plugin for post-training evaluation & inference, with:
+    Updated plugin for post-training evaluation & inference:
     - Model Zoo support
-    - Custom metrics (placeholder)
-    - Interactive visualizations with Plotly (optional)
-    - Additional export options (PDF, CSV, Excel stubs)
-    - Grad-CAM colormap selection & toggle
-    - Logging with timestamps & levels
-    - UI tips (tooltips)
-    - SHAP fallback
-    - Cancel button for batch tasks
-    - Basic test placeholders
-    - Single-inference export & preview functionality
+    - Transform pipeline (basic or advanced text-based)
+    - Memory usage limit
+    - Single-image inference in thread
+    - SHAP & Grad-CAM
+    - UI enhancements (open output folder, advanced metrics, etc.)
+    - Extended class names
+    - Logging via Python's logging module
+    - Additional Grad-CAM variants
+    - Unit test placeholders
     """
-
     def __init__(self):
         super().__init__()
         self.plugin_name = "Evaluation/Inference"
@@ -952,6 +1056,7 @@ class Plugin(BasePlugin):
         self.dspin_min_confidence = None
         self.cb_batch_gradcam = None
         self.cb_export_csv = None
+        self.cb_advanced_metrics = None
 
         self.text_log = None
         self.layer_combo = None
@@ -966,34 +1071,33 @@ class Plugin(BasePlugin):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.batch_thread = None
+        self.single_thread = None
 
-        # Model Zoo UI references
         self.model_zoo_combo = None
         self.btn_load_zoo_model = None
-
-        # Grad-CAM colormap selection & toggle
-        self.check_gradcam_overlay = None
+        self.gradcam_variant_combo = None
         self.colormap_combo = None
-
-        # Cancel button
         self.btn_cancel_batch = None
+        self.btn_load_class_names = None
+        self.spin_gpu_usage = None
+        self.check_adv_transform = None
+        self.adv_transform_textedit = None
+        self.spin_skip_shap_if_large = None
 
-        # ========== NEW FIELDS for Single-Inference Export ==========
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.DEBUG)
+
         self.last_single_inference_img = None
         self.last_single_inference_overlay = None
         self.last_single_inference_label_str = None
 
     def create_tab(self) -> QWidget:
-        """
-        Builds the main UI inside a QScrollArea.
-        """
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
 
         container_widget = QWidget()
         main_layout = QVBoxLayout(container_widget)
 
-        # Intro label / help
         help_label = QLabel(
             "Evaluation/Inference Plugin\n"
             "1. Load a custom checkpoint or select a pretrained model.\n"
@@ -1004,12 +1108,26 @@ class Plugin(BasePlugin):
         help_label.setStyleSheet("font-weight: bold;")
         main_layout.addWidget(help_label)
 
+        self.text_log = QTextEdit()
+        self.text_log.setReadOnly(True)
+        text_edit_handler = QTextEditLogger(self.text_log)
+        text_edit_handler.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        text_edit_handler.setFormatter(formatter)
+        self.logger.addHandler(text_edit_handler)
+
         main_layout.addLayout(self._create_ckpt_section())
         main_layout.addLayout(self._create_model_zoo_section())
         main_layout.addLayout(self._create_transform_section())
         main_layout.addLayout(self._create_single_infer_section())
         main_layout.addLayout(self._create_batch_infer_section())
-        main_layout.addWidget(self._create_progress_and_log())
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        main_layout.addWidget(self.progress_bar)
+
+        main_layout.addWidget(self.text_log)
 
         scroll_area.setWidget(container_widget)
         return scroll_area
@@ -1019,9 +1137,7 @@ class Plugin(BasePlugin):
         self.ckpt_edit = QLineEdit()
         self.ckpt_edit.setToolTip("Path to your trained .ckpt file.")
         btn_ckpt = QPushButton("Browse Checkpoint...")
-        btn_ckpt.setToolTip("Select a .ckpt file to load a custom model checkpoint.")
         btn_ckpt.clicked.connect(self.browse_ckpt)
-
         h_ckpt.addWidget(QLabel("Checkpoint:"))
         h_ckpt.addWidget(self.ckpt_edit)
         h_ckpt.addWidget(btn_ckpt)
@@ -1033,12 +1149,22 @@ class Plugin(BasePlugin):
         h_ckpt.addWidget(lbl_device)
         h_ckpt.addWidget(self.device_combo)
 
+        lbl_gpu_usage = QLabel("Max GPU Usage %:")
+        self.spin_gpu_usage = QSpinBox()
+        self.spin_gpu_usage.setRange(1, 100)
+        self.spin_gpu_usage.setValue(100)
+        self.spin_gpu_usage.setToolTip("Limit GPU memory usage fraction.")
+        h_ckpt.addWidget(lbl_gpu_usage)
+        h_ckpt.addWidget(self.spin_gpu_usage)
+
+        self.btn_load_class_names = QPushButton("Load Class Names from File...")
+        self.btn_load_class_names.setToolTip("Optional: load class names from a text or CSV.")
+        self.btn_load_class_names.clicked.connect(self.load_class_names_file)
+        h_ckpt.addWidget(self.btn_load_class_names)
+
         return h_ckpt
 
     def _create_model_zoo_section(self) -> QHBoxLayout:
-        """
-        Allows user to select a pretrained model from torchvision (model zoo).
-        """
         h_zoo = QHBoxLayout()
         self.model_zoo_combo = QComboBox()
         self.model_zoo_combo.setToolTip("Select a pretrained model from torchvision model zoo.")
@@ -1048,13 +1174,10 @@ class Plugin(BasePlugin):
             self.model_zoo_combo.addItem("No torchvision available")
 
         self.btn_load_zoo_model = QPushButton("Load Pretrained")
-        self.btn_load_zoo_model.setToolTip("Click to load the selected pretrained model.")
         self.btn_load_zoo_model.clicked.connect(self.load_zoo_model)
-
         h_zoo.addWidget(QLabel("Pretrained Model:"))
         h_zoo.addWidget(self.model_zoo_combo)
         h_zoo.addWidget(self.btn_load_zoo_model)
-
         return h_zoo
 
     def _create_transform_section(self) -> QVBoxLayout:
@@ -1062,7 +1185,6 @@ class Plugin(BasePlugin):
 
         self.resize_check = QCheckBox("Resize Images?")
         self.resize_check.setChecked(True)
-        self.resize_check.setToolTip("Check to resize images before inference.")
         transform_box.addWidget(self.resize_check)
 
         self.maintain_ar_check = QCheckBox("Maintain Aspect Ratio (pad)")
@@ -1074,18 +1196,14 @@ class Plugin(BasePlugin):
         self.resize_width_spin = QSpinBox()
         self.resize_width_spin.setRange(1, 5000)
         self.resize_width_spin.setValue(224)
-        self.resize_width_spin.setToolTip("Resize width.")
         h_resize.addWidget(self.resize_width_spin)
-
         h_resize.addWidget(QLabel("Height:"))
         self.resize_height_spin = QSpinBox()
         self.resize_height_spin.setRange(1, 5000)
         self.resize_height_spin.setValue(224)
-        self.resize_height_spin.setToolTip("Resize height.")
         h_resize.addWidget(self.resize_height_spin)
         transform_box.addLayout(h_resize)
 
-        # Mean/Std
         norm_layout = QHBoxLayout()
         norm_layout.addWidget(QLabel("Mean:"))
         for _ in range(3):
@@ -1093,7 +1211,6 @@ class Plugin(BasePlugin):
             sp.setRange(0.0, 1.0)
             sp.setSingleStep(0.01)
             sp.setValue(0.5)
-            sp.setToolTip("Normalization mean for each channel.")
             self.mean_spin.append(sp)
             norm_layout.addWidget(sp)
 
@@ -1103,11 +1220,21 @@ class Plugin(BasePlugin):
             sp.setRange(0.0, 10.0)
             sp.setSingleStep(0.01)
             sp.setValue(0.5)
-            sp.setToolTip("Normalization std for each channel.")
             self.std_spin.append(sp)
             norm_layout.addWidget(sp)
 
         transform_box.addLayout(norm_layout)
+
+        self.check_adv_transform = QCheckBox("Use advanced text-based transform config?")
+        self.check_adv_transform.setChecked(False)
+        transform_box.addWidget(self.check_adv_transform)
+
+        self.adv_transform_textedit = QTextEdit()
+        self.adv_transform_textedit.setPlaceholderText(
+            "Example:\nA.Compose([\n    A.RandomCrop(200, 200),\n    A.HorizontalFlip(p=0.5),\n    A.Normalize(...),\n    ToTensorV2(),\n])"
+        )
+        self.adv_transform_textedit.setFixedHeight(100)
+        transform_box.addWidget(self.adv_transform_textedit)
 
         return transform_box
 
@@ -1116,7 +1243,6 @@ class Plugin(BasePlugin):
 
         h_img = QHBoxLayout()
         self.infer_img_edit = QLineEdit()
-        self.infer_img_edit.setToolTip("Path to a single image for inference.")
         btn_img = QPushButton("Browse Image...")
         btn_img.clicked.connect(self.browse_infer_image)
         h_img.addWidget(QLabel("Test Image:"))
@@ -1124,73 +1250,59 @@ class Plugin(BasePlugin):
         h_img.addWidget(btn_img)
         layout.addLayout(h_img)
 
-        self.cb_gradcam_pp = QCheckBox("Use Grad-CAM++ (single image)")
-        self.cb_gradcam_pp.setToolTip("If checked, use Grad-CAM++. Otherwise, standard Grad-CAM.")
+        gradcam_variant_layout = QHBoxLayout()
+        gradcam_variant_layout.addWidget(QLabel("Grad-CAM Variant:"))
+        self.gradcam_variant_combo = QComboBox()
+        self.gradcam_variant_combo.addItems(["Grad-CAM", "Grad-CAM++", "XGradCAM"])
+        gradcam_variant_layout.addWidget(self.gradcam_variant_combo)
+        layout.addLayout(gradcam_variant_layout)
+
+        self.cb_gradcam_pp = QCheckBox("Use Grad-CAM++ (legacy toggle)")
         layout.addWidget(self.cb_gradcam_pp)
 
         alpha_layout = QHBoxLayout()
         alpha_layout.addWidget(QLabel("Grad-CAM Overlay Alpha:"))
         self.dspin_overlay_alpha = QDoubleSpinBox()
-        self.dspin_overlay_alpha.setRange(0.0, 1.0)
-        self.dspin_overlay_alpha.setSingleStep(0.1)
+        self.dspin_overlay_alpha.setRange(0, 1)
         self.dspin_overlay_alpha.setValue(0.5)
         alpha_layout.addWidget(self.dspin_overlay_alpha)
         layout.addLayout(alpha_layout)
 
-        # Additional checkbox to toggle Grad-CAM overlay on/off
-        self.check_gradcam_overlay = QCheckBox("Enable Grad-CAM Overlay")
-        self.check_gradcam_overlay.setChecked(True)
-        layout.addWidget(self.check_gradcam_overlay)
-
-        # Colormap combo
+        h_cmap = QHBoxLayout()
+        h_cmap.addWidget(QLabel("Grad-CAM Colormap:"))
         self.colormap_combo = QComboBox()
         self.colormap_combo.addItems(["JET", "HOT", "BONE", "HSV"])
-        self.colormap_combo.setToolTip("Select the color map for Grad-CAM overlay.")
-        colormap_layout = QHBoxLayout()
-        colormap_layout.addWidget(QLabel("Grad-CAM Colormap:"))
-        colormap_layout.addWidget(self.colormap_combo)
-        layout.addLayout(colormap_layout)
+        h_cmap.addWidget(self.colormap_combo)
+        layout.addLayout(h_cmap)
 
         tk_layout = QHBoxLayout()
         tk_layout.addWidget(QLabel("Top-k:"))
         self.spin_top_k = QSpinBox()
         self.spin_top_k.setRange(1, 10)
         self.spin_top_k.setValue(1)
-        self.spin_top_k.setToolTip("Show top-k classes.")
         tk_layout.addWidget(self.spin_top_k)
 
         tk_layout.addWidget(QLabel("Min Confidence (%):"))
         self.dspin_min_confidence = QDoubleSpinBox()
-        self.dspin_min_confidence.setRange(0.0, 100.0)
-        self.dspin_min_confidence.setValue(10.0)
-        self.dspin_min_confidence.setSingleStep(1.0)
-        self.dspin_min_confidence.setToolTip("Hide predictions below this confidence.")
+        self.dspin_min_confidence.setRange(0, 100)
+        self.dspin_min_confidence.setValue(10)
+        self.dspin_min_confidence.setSingleStep(1)
         tk_layout.addWidget(self.dspin_min_confidence)
-
         layout.addLayout(tk_layout)
 
         layer_layout = QHBoxLayout()
         layer_layout.addWidget(QLabel("Target Layer:"))
         self.layer_combo = QComboBox()
-        self.layer_combo.setToolTip("Select which layer to hook for Grad-CAM.")
         layer_layout.addWidget(self.layer_combo)
         layout.addLayout(layer_layout)
 
         btn_infer = QPushButton("Run Inference (Single)")
-        btn_infer.setToolTip("Run single-image inference with the loaded model.")
         btn_infer.clicked.connect(self.run_inference)
         layout.addWidget(btn_infer)
 
-        # --- NEW Export button ---
         btn_export_single = QPushButton("Export Single Inference Results")
-        btn_export_single.setToolTip("Export the single inference (original, overlay, predictions) to a folder.")
         btn_export_single.clicked.connect(self.export_single_inference_result)
         layout.addWidget(btn_export_single)
-
-        # (Optional) If you want a button to open overlay in system viewer, uncomment below:
-        # btn_open_viewer = QPushButton("Open Overlay in Viewer")
-        # btn_open_viewer.clicked.connect(self.open_overlay_in_viewer)
-        # layout.addWidget(btn_open_viewer)
 
         self.infer_result_label = QLabel("Result: ")
         layout.addWidget(self.infer_result_label)
@@ -1213,7 +1325,6 @@ class Plugin(BasePlugin):
 
         batch_inf_layout = QHBoxLayout()
         self.inference_input_dir = QLineEdit()
-        self.inference_input_dir.setToolTip("Folder containing images for batch inference.")
         btn_infer_dir = QPushButton("Browse Folder...")
         btn_infer_dir.clicked.connect(self.browse_inference_folder)
         batch_inf_layout.addWidget(QLabel("Inference Folder:"))
@@ -1223,13 +1334,16 @@ class Plugin(BasePlugin):
 
         h_gtcsv = QHBoxLayout()
         self.gt_csv_edit = QLineEdit()
-        self.gt_csv_edit.setToolTip("Optional CSV file with ground truth labels.")
         btn_gtcsv = QPushButton("Browse GT CSV...")
-        btn_gtcsv.clicked.connect(self.browse_gt_csv)
+        btn_gtcsv.clicked.connect(self.browse_gt_csv)  # <--- ADDED HERE
         h_gtcsv.addWidget(QLabel("GT CSV (optional):"))
         h_gtcsv.addWidget(self.gt_csv_edit)
         h_gtcsv.addWidget(btn_gtcsv)
         layout.addLayout(h_gtcsv)
+
+        self.cb_advanced_metrics = QCheckBox("Compute Advanced Metrics (ROC, PR, etc.)")
+        self.cb_advanced_metrics.setChecked(True)
+        layout.addWidget(self.cb_advanced_metrics)
 
         roc_layout = QHBoxLayout()
         roc_layout.addWidget(QLabel("ROC/PR Average Mode:"))
@@ -1240,7 +1354,6 @@ class Plugin(BasePlugin):
         layout.addLayout(roc_layout)
 
         self.cb_enable_shap = QCheckBox("Enable SHAP analysis")
-        self.cb_enable_shap.setToolTip("Check to run SHAP if shap library is installed.")
         layout.addWidget(self.cb_enable_shap)
 
         shap_layout = QHBoxLayout()
@@ -1257,13 +1370,20 @@ class Plugin(BasePlugin):
         shap_layout.addWidget(self.spin_shap_bg_samples)
         layout.addLayout(shap_layout)
 
+        h_skip_shap = QHBoxLayout()
+        h_skip_shap.addWidget(QLabel("Skip SHAP if dimension >"))
+        self.spin_skip_shap_if_large = QSpinBox()
+        self.spin_skip_shap_if_large.setRange(256, 9999)
+        self.spin_skip_shap_if_large.setValue(1024)
+        h_skip_shap.addWidget(self.spin_skip_shap_if_large)
+        h_skip_shap.addWidget(QLabel("(either width or height)"))
+        layout.addLayout(h_skip_shap)
+
         self.cb_batch_gradcam = QCheckBox("Generate Grad-CAM in Batch Inference?")
-        self.cb_batch_gradcam.setToolTip("If checked, Grad-CAM overlays will be generated for top-1 predictions.")
         self.cb_batch_gradcam.setChecked(True)
         layout.addWidget(self.cb_batch_gradcam)
 
         self.cb_export_csv = QCheckBox("Export CSV for predictions?")
-        self.cb_export_csv.setToolTip("If checked, saves predictions to a CSV file.")
         layout.addWidget(self.cb_export_csv)
 
         h_batch_size = QHBoxLayout()
@@ -1274,35 +1394,38 @@ class Plugin(BasePlugin):
         h_batch_size.addWidget(self.spin_batch_size)
         layout.addLayout(h_batch_size)
 
-        # Buttons for batch
         h_btns = QHBoxLayout()
         btn_batch_infer = QPushButton("Run Batch Inference")
         btn_batch_infer.clicked.connect(self.start_batch_inference)
         h_btns.addWidget(btn_batch_infer)
 
         self.btn_cancel_batch = QPushButton("Cancel Batch")
-        self.btn_cancel_batch.setToolTip("Stop the ongoing batch inference.")
         self.btn_cancel_batch.clicked.connect(self.cancel_batch_inference)
         h_btns.addWidget(self.btn_cancel_batch)
 
-        layout.addLayout(h_btns)
+        btn_open_output = QPushButton("Open Output Folder")
+        btn_open_output.clicked.connect(self.open_output_folder)
+        h_btns.addWidget(btn_open_output)
 
+        btn_open_plotly = QPushButton("Open Plotly HTMLs")
+        btn_open_plotly.clicked.connect(self.open_plotly_html_results)
+        h_btns.addWidget(btn_open_plotly)
+
+        layout.addLayout(h_btns)
         return layout
 
-    def _create_progress_and_log(self) -> QWidget:
-        container = QWidget()
-        v_layout = QVBoxLayout(container)
+    def browse_inference_folder(self):
+        folder = QFileDialog.getExistingDirectory(None, "Select Inference Folder")
+        if folder:
+            self.inference_input_dir.setText(folder)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(False)
-        v_layout.addWidget(self.progress_bar)
-
-        self.text_log = QTextEdit()
-        self.text_log.setReadOnly(True)
-        v_layout.addWidget(self.text_log)
-
-        return container
+    def browse_gt_csv(self):
+        """
+        Opens a file dialog to select a ground-truth CSV file, sets path to gt_csv_edit.
+        """
+        fpath, _ = QFileDialog.getOpenFileName(None, "Select GT CSV", filter="CSV Files (*.csv)")
+        if fpath:
+            self.gt_csv_edit.setText(fpath)
 
     def load_zoo_model(self):
         if not HAVE_TORCHVISION or not ZOO_MODELS:
@@ -1313,10 +1436,18 @@ class Plugin(BasePlugin):
             QMessageBox.warning(None, "Error", f"Invalid model name: {model_name}")
             return
         self.device = self.get_selected_device()
+
+        fraction = self.spin_gpu_usage.value() / 100.0
+        if self.device.type == "cuda":
+            try:
+                torch.cuda.set_per_process_memory_fraction(fraction)
+            except AttributeError:
+                self.logger.warning("set_per_process_memory_fraction not supported.")
+
         try:
             self.model = ZOO_MODELS[model_name](pretrained=True)
             self.model.eval().to(self.device)
-            self.class_names = None  # Typically no class_names from zoo
+            self.class_names = None
 
             self.available_layers = self.discover_conv_layers(self.model)
             self.layer_combo.clear()
@@ -1328,13 +1459,13 @@ class Plugin(BasePlugin):
             QMessageBox.information(
                 None,
                 "Model Loaded",
-                f"Pretrained model '{model_name}' loaded successfully.\n"
-                f"Found {len(self.available_layers)} candidate layers."
+                f"Pretrained model '{model_name}' loaded.\nFound {len(self.available_layers)} candidate layers."
             )
         except Exception as e:
-            QMessageBox.critical(None, "Load Error", f"Failed to load zoo model '{model_name}': {str(e)}")
+            QMessageBox.critical(None, "Load Error", f"Failed to load zoo model '{model_name}': {e}")
+            self.logger.error(f"Failed to load zoo model '{model_name}': {e}")
 
-    def get_selected_device(self):
+    def get_selected_device(self) -> torch.device:
         choice = self.device_combo.currentText()
         if choice == "CPU":
             return torch.device("cpu")
@@ -1352,6 +1483,13 @@ class Plugin(BasePlugin):
             self.ckpt_edit.setText(fpath)
             try:
                 self.device = self.get_selected_device()
+                fraction = self.spin_gpu_usage.value() / 100.0
+                if self.device.type == "cuda":
+                    try:
+                        torch.cuda.set_per_process_memory_fraction(fraction)
+                    except AttributeError:
+                        self.logger.warning("set_per_process_memory_fraction not supported.")
+
                 self.model = MaidClassifier.load_from_checkpoint(fpath)
                 self.model.to(self.device).eval()
 
@@ -1374,9 +1512,10 @@ class Plugin(BasePlugin):
                 )
             except Exception as e:
                 traceback.print_exc()
-                QMessageBox.critical(None, "Load Error", f"Failed to load model:\n{str(e)}")
+                QMessageBox.critical(None, "Load Error", f"Failed to load model:\n{e}")
+                self.logger.error(f"Failed to load checkpoint: {e}")
 
-    def discover_conv_layers(self, net: torch.nn.Module):
+    def discover_conv_layers(self, net: torch.nn.Module) -> list:
         layers_list = []
 
         def recurse_layers(parent, parent_name):
@@ -1391,18 +1530,11 @@ class Plugin(BasePlugin):
         return layers_list
 
     def browse_infer_image(self):
-        fpath, _ = QFileDialog.getOpenFileName(
-            None, "Select an Image",
-            filter="Images (*.png *.jpg *.jpeg *.tif *.tiff)"
-        )
+        fpath, _ = QFileDialog.getOpenFileName(None, "Select an Image", filter="Images (*.png *.jpg *.jpeg *.tif *.tiff)")
         if fpath:
             self.infer_img_edit.setText(fpath)
 
     def run_inference(self):
-        """
-        Overridden single-inference method with small addition:
-        - Store images/results in the new 'last_single_inference_*' fields for exporting.
-        """
         if not self.model:
             QMessageBox.warning(None, "Error", "Model not loaded.")
             return
@@ -1417,8 +1549,6 @@ class Plugin(BasePlugin):
             return
         self.target_layer = self.available_layers[idx_layer][1]
 
-        transform = self.build_transform()
-
         try:
             bgr_img = cv2.imread(img_path)
             if bgr_img is None:
@@ -1432,138 +1562,52 @@ class Plugin(BasePlugin):
                 Qt.KeepAspectRatio
             ))
 
-            label_str, overlay = self.infer_image_single(bgr_img, transform)
-            self.infer_result_label.setText(f"Result: {label_str}")
+            transform = self.build_transform()
 
-            if overlay is not None:
-                pm_cam = convert_to_qpixmap(overlay)
-                self.label_infer_cam.setPixmap(pm_cam.scaled(
-                    self.label_infer_cam.width(),
-                    self.label_infer_cam.height(),
-                    Qt.KeepAspectRatio
-                ))
-            else:
-                self.label_infer_cam.setPixmap(QPixmap())
+            colormap_id = self.get_colormap_id()
+            gradcam_variant = self.gradcam_variant_combo.currentText()
 
-            # Store them for export
-            self.last_single_inference_img = bgr_img.copy()
-            self.last_single_inference_overlay = overlay.copy() if overlay is not None else None
-            self.last_single_inference_label_str = label_str
+            self.single_thread = SingleInferenceThread(
+                bgr_image=bgr_img,
+                model=self.model,
+                device=self.get_selected_device(),
+                transform=transform,
+                cam_variant=gradcam_variant,
+                target_layer=self.target_layer,
+                top_k=self.spin_top_k.value(),
+                min_conf=self.dspin_min_confidence.value(),
+                overlay_alpha=self.dspin_overlay_alpha.value(),
+                colormap_id=colormap_id,
+                do_gradcam=True,
+                class_names=self.class_names
+            )
+            self.single_thread.progress_signal.connect(self._on_single_inference_progress)
+            self.single_thread.done_signal.connect(self._on_single_inference_done)
+            self.single_thread.start()
 
         except Exception as e:
             traceback.print_exc()
             QMessageBox.critical(None, "Inference Error", str(e))
+            self.logger.error(f"Inference error: {e}")
 
-    def infer_image_single(self, bgr_img: np.ndarray, transform: A.Compose):
-        rgb_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
-        aug = transform(image=rgb_img)
-        input_tensor = aug["image"].unsqueeze(0).to(self.device)
+    def _on_single_inference_progress(self, msg: str):
+        self.logger.info(msg)
 
-        top_k = self.spin_top_k.value()
-        min_conf = self.dspin_min_confidence.value()
+    def _on_single_inference_done(self, overlay, original, label_str):
+        self.infer_result_label.setText(f"Result: {label_str}")
+        self.last_single_inference_img = original.copy()
+        self.last_single_inference_overlay = overlay.copy() if overlay is not None else None
+        self.last_single_inference_label_str = label_str
 
-        with torch.no_grad():
-            if self.device.type == 'cuda':
-                with torch.cuda.amp.autocast():
-                    logits = self.model(input_tensor)
-            else:
-                logits = self.model(input_tensor)
-
-            probs = torch.softmax(logits, dim=1)
-
-        topk_vals, topk_indices = torch.topk(probs, k=top_k, dim=1)
-        result_items = []
-        if self.class_names:
-            n_classes = len(self.class_names)
+        if overlay is not None:
+            pm_cam = convert_to_qpixmap(overlay)
+            self.label_infer_cam.setPixmap(pm_cam.scaled(
+                self.label_infer_cam.width(),
+                self.label_infer_cam.height(),
+                Qt.KeepAspectRatio
+            ))
         else:
-            n_classes = None
-
-        for rank in range(topk_vals.size(1)):
-            cls_idx = topk_indices[0, rank].item()
-            conf = topk_vals[0, rank].item() * 100.0
-            if n_classes and cls_idx < n_classes:
-                cls_name = self.class_names[cls_idx]
-            else:
-                cls_name = f"Class {cls_idx}"
-
-            if conf < min_conf:
-                label_conf_str = f"Uncertain (<{min_conf:.1f}%)"
-            else:
-                label_conf_str = f"{cls_name} ({conf:.1f}%)"
-            result_items.append(label_conf_str)
-
-        label_str = " | ".join(result_items)
-
-        overlay = None
-        if self.check_gradcam_overlay.isChecked():
-            # Which colormap
-            cmap_name = self.colormap_combo.currentText()
-            if cmap_name == "JET":
-                colormap_id = cv2.COLORMAP_JET
-            elif cmap_name == "HOT":
-                colormap_id = cv2.COLORMAP_HOT
-            elif cmap_name == "BONE":
-                colormap_id = cv2.COLORMAP_BONE
-            elif cmap_name == "HSV":
-                colormap_id = cv2.COLORMAP_HSV
-            else:
-                colormap_id = cv2.COLORMAP_JET
-
-            use_pp = self.cb_gradcam_pp.isChecked()
-            if use_pp:
-                gradcam_obj = GradCAMPlusPlus(self.model, self.target_layer)
-            else:
-                gradcam_obj = GradCAM(self.model, self.target_layer)
-
-            pred_class = topk_indices[0, 0].item()
-            input_tensor.requires_grad = True
-            cam_map = gradcam_obj.generate_cam(input_tensor, target_class=pred_class)
-            cam_resized = cv2.resize(cam_map, (bgr_img.shape[1], bgr_img.shape[0]))
-            alpha_val = self.dspin_overlay_alpha.value()
-            overlay = overlay_cam_on_image(bgr_img, cam_resized, alpha=alpha_val, colormap=colormap_id)
-
-        del input_tensor
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
-
-        return label_str, overlay
-
-    def build_transform(self) -> A.Compose:
-        do_resize = self.resize_check.isChecked()
-        w = self.resize_width_spin.value()
-        h = self.resize_height_spin.value()
-        means = tuple(sp.value() for sp in self.mean_spin)
-        stds = tuple(sp.value() for sp in self.std_spin)
-        maintain_ar = self.maintain_ar_check.isChecked()
-
-        transforms_list = []
-        if do_resize:
-            if maintain_ar:
-                transforms_list.append(A.LongestMaxSize(max_size=max(w, h)))
-                transforms_list.append(
-                    A.PadIfNeeded(
-                        min_height=h,
-                        min_width=w,
-                        border_mode=cv2.BORDER_CONSTANT,
-                        value=(0, 0, 0)
-                    )
-                )
-            else:
-                transforms_list.append(A.Resize(height=h, width=w))
-
-        transforms_list.append(A.Normalize(mean=means, std=stds))
-        transforms_list.append(ToTensorV2())
-        return A.Compose(transforms_list)
-
-    def browse_inference_folder(self):
-        folder = QFileDialog.getExistingDirectory(None, "Select Inference Folder")
-        if folder:
-            self.inference_input_dir.setText(folder)
-
-    def browse_gt_csv(self):
-        fpath, _ = QFileDialog.getOpenFileName(None, "Select CSV File", filter="*.csv")
-        if fpath:
-            self.gt_csv_edit.setText(fpath)
+            self.label_infer_cam.setPixmap(QPixmap())
 
     def start_batch_inference(self):
         if not self.model:
@@ -1576,6 +1620,13 @@ class Plugin(BasePlugin):
             return
 
         self.device = self.get_selected_device()
+        fraction = self.spin_gpu_usage.value() / 100.0
+        if self.device.type == "cuda":
+            try:
+                torch.cuda.set_per_process_memory_fraction(fraction)
+            except AttributeError:
+                self.logger.warning("set_per_process_memory_fraction not supported.")
+
         transform = self.build_transform()
 
         idx_layer = self.layer_combo.currentIndex()
@@ -1586,6 +1637,10 @@ class Plugin(BasePlugin):
 
         out_dir = os.path.join(input_dir, "inference_results")
         os.makedirs(out_dir, exist_ok=True)
+
+        cam_variant = self.gradcam_variant_combo.currentText()
+        if self.cb_gradcam_pp.isChecked():
+            cam_variant = "Grad-CAM++"
 
         params = {
             "model": self.model,
@@ -1606,24 +1661,27 @@ class Plugin(BasePlugin):
             "do_shap": self.cb_enable_shap.isChecked(),
             "shap_samples": self.spin_shap_samples.value(),
             "shap_bg": self.spin_shap_bg_samples.value(),
-            "batch_size": self.spin_batch_size.value()
+            "batch_size": self.spin_batch_size.value(),
+            "compute_advanced_metrics": self.cb_advanced_metrics.isChecked(),
+            "skip_shap_if_large": self.spin_skip_shap_if_large.value(),
+            "cam_variant": cam_variant,
+            "colormap_id": self.get_colormap_id()
         }
 
         self.batch_thread = BatchInferenceThread(params=params)
         self.batch_thread.progress_signal.connect(self.update_progress)
-        self.batch_thread.log_signal.connect(self.append_log)
+        self.batch_thread.log_signal.connect(self._append_log_direct)
         self.batch_thread.done_signal.connect(self.batch_inference_done)
 
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        # Indefinite range initially
         self.progress_bar.setRange(0, 0)
         self.batch_thread.start()
 
     def cancel_batch_inference(self):
         if self.batch_thread and self.batch_thread.isRunning():
             self.batch_thread.cancel()
-            self.append_log("[INFO] Cancel requested.")
+            self.logger.info("[INFO] Cancel requested.")
 
     def update_progress(self, val: int):
         current_max = self.progress_bar.maximum()
@@ -1631,54 +1689,89 @@ class Plugin(BasePlugin):
             self.progress_bar.setRange(0, val)
         self.progress_bar.setValue(val)
 
-    def append_log(self, msg: str):
+    def _append_log_direct(self, msg: str):
         self.text_log.append(msg)
         self.text_log.ensureCursorVisible()
 
     def batch_inference_done(self, results_dir: str, metrics: dict):
         self.progress_bar.setVisible(False)
         if results_dir == "ERROR":
-            self.append_log("[ERROR] Batch inference encountered an error.")
+            self.logger.error("[ERROR] Batch inference encountered an error.")
             return
-        self.append_log("[INFO] Batch inference completed.")
+        self.logger.info("[INFO] Batch inference completed.")
         if "confusion_matrix" in metrics:
             cm = metrics["confusion_matrix"]
-            self.append_log(f"Confusion Matrix:\n{cm}\n")
+            self.logger.info(f"Confusion Matrix:\n{cm}\n")
         if "class_report" in metrics:
             cr = metrics["class_report"]
-            self.append_log(f"Classification Report:\n{cr}\n")
-        QMessageBox.information(
-            None,
-            "Batch Inference Finished",
-            f"Results saved in: {results_dir}"
-        )
+            self.logger.info(f"Classification Report:\n{cr}\n")
 
-    # =============== NEW METHOD: Export single inference result ===============
+        QMessageBox.information(None, "Batch Inference Finished", f"Results saved in: {results_dir}")
+
+    def build_transform(self) -> A.Compose:
+        if self.check_adv_transform.isChecked():
+            user_code = self.adv_transform_textedit.toPlainText().strip()
+            if user_code:
+                try:
+                    loc = {}
+                    safe_namespace = {"A": A, "ToTensorV2": ToTensorV2, "__builtins__": {}}
+                    exec(f"transform_obj = {user_code}", safe_namespace, loc)
+                    transform_candidate = loc.get("transform_obj", None)
+                    if transform_candidate and isinstance(transform_candidate, A.Compose):
+                        return transform_candidate
+                    else:
+                        self.logger.warning("Advanced transform code invalid. Reverting to basic.")
+                except Exception as e:
+                    self.logger.error(f"Error parsing advanced transform: {e}. Reverting.")
+                    QMessageBox.warning(None, "Transform Error", f"Failed to parse advanced transform:\n{e}")
+
+        do_resize = self.resize_check.isChecked()
+        w = self.resize_width_spin.value()
+        h = self.resize_height_spin.value()
+        means = tuple(sp.value() for sp in self.mean_spin)
+        stds = tuple(sp.value() for sp in self.std_spin)
+        maintain_ar = self.maintain_ar_check.isChecked()
+
+        transforms_list = []
+        if do_resize:
+            if maintain_ar:
+                transforms_list.append(A.LongestMaxSize(max_size=max(w, h)))
+                transforms_list.append(
+                    A.PadIfNeeded(min_height=h, min_width=w, border_mode=cv2.BORDER_CONSTANT, value=(0, 0, 0))
+                )
+            else:
+                transforms_list.append(A.Resize(height=h, width=w))
+
+        transforms_list.append(A.Normalize(mean=means, std=stds))
+        transforms_list.append(ToTensorV2())
+        return A.Compose(transforms_list)
+
+    def get_colormap_id(self) -> int:
+        cmap_name = self.colormap_combo.currentText()
+        if cmap_name == "HOT":
+            return cv2.COLORMAP_HOT
+        elif cmap_name == "BONE":
+            return cv2.COLORMAP_BONE
+        elif cmap_name == "HSV":
+            return cv2.COLORMAP_HSV
+        return cv2.COLORMAP_JET
+
     def export_single_inference_result(self):
-        """
-        Let the user pick a folder and export:
-          - Original image
-          - Overlay (if exists)
-          - A CSV file containing the predicted classes
-        """
         if self.last_single_inference_img is None:
-            QMessageBox.warning(None, "Error", "No inference result to export. Run single inference first.")
+            QMessageBox.warning(None, "Error", "No inference result to export.")
             return
 
         out_dir = QFileDialog.getExistingDirectory(None, "Select Folder to Save Inference Results")
         if not out_dir:
             return
 
-        # Save original
         orig_path = os.path.join(out_dir, "inference_original.png")
         cv2.imwrite(orig_path, self.last_single_inference_img)
 
-        # Save overlay if available
         if self.last_single_inference_overlay is not None:
             overlay_path = os.path.join(out_dir, "inference_overlay.png")
             cv2.imwrite(overlay_path, self.last_single_inference_overlay)
 
-        # Save predictions
         results_csv = os.path.join(out_dir, "inference_results.csv")
         with open(results_csv, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
@@ -1687,37 +1780,67 @@ class Plugin(BasePlugin):
 
         QMessageBox.information(None, "Export Done", f"Inference results saved to:\n{out_dir}")
 
-    # =============== (OPTIONAL) OPEN OVERLAY IN DEFAULT VIEWER ===============
-    def open_overlay_in_viewer(self):
-        """
-        If you'd like to open the overlay image in the system’s default viewer.
-        Uncomment the button creation in _create_single_infer_section.
-        """
-        if self.last_single_inference_overlay is None:
-            QMessageBox.warning(None, "Error", "No overlay available to open. Make sure Grad-CAM is enabled.")
+    def open_output_folder(self):
+        input_dir = self.inference_input_dir.text().strip()
+        if not os.path.isdir(input_dir):
+            QMessageBox.warning(None, "Error", "No valid input folder set.")
+            return
+        out_dir = os.path.join(input_dir, "inference_results")
+        if os.path.isdir(out_dir):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(out_dir))
+        else:
+            QMessageBox.warning(None, "Error", f"No results directory found at: {out_dir}")
+
+    def open_plotly_html_results(self):
+        input_dir = self.inference_input_dir.text().strip()
+        if not os.path.isdir(input_dir):
+            QMessageBox.warning(None, "Error", "No valid input folder set.")
+            return
+        out_dir = os.path.join(input_dir, "inference_results")
+        if not os.path.isdir(out_dir):
+            QMessageBox.warning(None, "Error", f"No results directory found at: {out_dir}")
             return
 
-        # Save to a temporary file
-        temp_path = os.path.join(tempfile.gettempdir(), "temp_overlay_preview.png")
-        cv2.imwrite(temp_path, self.last_single_inference_overlay)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(temp_path))
+        html_files = glob.glob(os.path.join(out_dir, "*.html"))
+        if not html_files:
+            QMessageBox.information(None, "No Plotly Files", "No HTML files found in output folder.")
+            return
 
-    # ------------- Example unit tests placeholders -------------
+        for hf in html_files:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(hf))
+
+    def load_class_names_file(self):
+        fpath, _ = QFileDialog.getOpenFileName(None, "Select Class Names File", filter="*.txt *.csv")
+        if not fpath:
+            return
+        new_names = []
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    name = line.strip()
+                    if name:
+                        new_names.append(name)
+            self.class_names = new_names
+            QMessageBox.information(None, "Class Names Loaded", f"Loaded {len(new_names)} class names.")
+        except Exception as e:
+            QMessageBox.critical(None, "Error", f"Failed to load class names:\n{e}")
+
+    # -----------------------------
+    # Unit Test Placeholders
+    # -----------------------------
     def test_convert_to_qpixmap(self):
         arr = np.zeros((100, 100, 3), dtype=np.uint8)
         pix = convert_to_qpixmap(arr)
-        assert isinstance(pix, QPixmap), "convert_to_qpixmap did not return a QPixmap."
+        assert isinstance(pix, QPixmap), "convert_to_qpixmap did not return QPixmap."
 
     def test_metric_calculations(self):
-        # Example: a sanity-check for a confusion matrix
         y_true = [0, 0, 1, 1]
         y_pred = [0, 1, 1, 0]
         cm = confusion_matrix(y_true, y_pred)
         assert cm.shape == (2, 2), "Confusion matrix shape mismatch."
 
     def test_run_shap_analysis_edge_cases(self):
-        # Minimal check if shap is installed
         if HAVE_SHAP:
-            pass  # you can add in-depth tests here
+            pass
         else:
-            pass  # shap not available
+            pass
